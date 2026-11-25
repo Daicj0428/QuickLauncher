@@ -123,7 +123,6 @@ install.bat/.ps1       安装脚本
 uninstall.bat/.ps1     卸载脚本
 config.example.json    配置模板
 README.txt             面向普通用户的详细说明
-tools/push_via_api.py  网络受限时用 GitHub API 推送（开发者工具）
 ```
 
 ## 网络/权限说明
@@ -136,21 +135,6 @@ tools/push_via_api.py  网络受限时用 GitHub API 推送（开发者工具）
 
 - 仓库里的 `config.json`、`data\`、`*.exe`、`release\` 都被 `.gitignore` 排除，不包含任何本机路径、日志或凭据
 - 想在新电脑上更新：`git pull` 后直接跑 `python launcher.py`，或重新 `build.bat`
-
-```bat
-git fetch origin main
-git reset --hard origin/main
-```
-
-### 网络受限时如何推送
-
-如果 `github.com:443` 连不上（`git push` 报 `Failed to connect`），但 `api.github.com` 能通，可以用：
-
-```bat
-python tools\push_via_api.py
-```
-
-它会读取凭据（`GITHUB_TOKEN` 环境变量 → Windows 凭据管理器 → `git credential`），通过 GitHub REST API 把当前目录的文件提交上去（自动新建仓库、自动生成 commit）。
 
 ## 许可
 
