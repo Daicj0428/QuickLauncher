@@ -18,6 +18,7 @@ import base64
 import ctypes
 import json
 import os
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -114,6 +115,40 @@ def get_token():
     return None, None
 
 
+# ---------------------------------------------------------------- 代理
+_OPENER = None
+
+
+def detect_proxy():
+    """环境变量优先; 否则探测本机常见代理端口 (Clash Verge 7897 / Clash 7890 ...)。"""
+    for env in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        v = os.environ.get(env)
+        if v:
+            return v if "://" in v else "http://" + v
+    for port in (7897, 7890, 10809, 1080, 8080):
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.25)
+            s.close()
+            return "http://127.0.0.1:%d" % port
+        except OSError:
+            continue
+    return None
+
+
+def get_opener():
+    global _OPENER
+    if _OPENER is None:
+        proxy = detect_proxy()
+        if proxy:
+            print("使用代理: %s" % proxy)
+            _OPENER = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            print("直连 (未发现代理)")
+            _OPENER = urllib.request.build_opener()
+    return _OPENER
+
+
 # ---------------------------------------------------------------- API
 def api(path, token, method="GET", payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -126,7 +161,7 @@ def api(path, token, method="GET", payload=None):
             "Content-Type": "application/json",
         })
     try:
-        with urllib.request.urlopen(req, timeout=40) as r:
+        with get_opener().open(req, timeout=60) as r:
             body = r.read().decode() or "{}"
             return r.status, json.loads(body)
     except urllib.error.HTTPError as e:
