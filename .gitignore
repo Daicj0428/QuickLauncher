@@ -1,0 +1,21 @@
+# ---- 本机数据（不推送） ----
+config.json
+data/
+release/
+*.exe
+*.zip
+
+# ---- 构建产物 ----
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ---- 编辑器 / 系统 ----
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

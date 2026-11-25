@@ -1,0 +1,36 @@
+{
+  "apps": [],
+  "apps_seeded": false,
+  "current_mode": "",
+  "proxy_server": "127.0.0.1:7890",
+  "dns_presets": [
+    {
+      "name": "自动获取 (DHCP)",
+      "servers": [
+        "dhcp"
+      ]
+    },
+    {
+      "name": "阿里 DNS (223.5.5.5)",
+      "servers": [
+        "223.5.5.5",
+        "223.6.6.6"
+      ]
+    },
+    {
+      "name": "114 DNS",
+      "servers": [
+        "114.114.114.114",
+        "114.114.115.115"
+      ]
+    },
+    {
+      "name": "Google DNS (8.8.8.8)",
+      "servers": [
+        "8.8.8.8",
+        "8.8.4.4"
+      ]
+    }
+  ],
+  "modes": []
+}
