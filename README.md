@@ -136,7 +136,6 @@ tools/push_via_api.py  网络受限时用 GitHub API 推送（开发者工具）
 
 - 仓库里的 `config.json`、`data\`、`*.exe`、`release\` 都被 `.gitignore` 排除，不包含任何本机路径、日志或凭据
 - 想在新电脑上更新：`git pull` 后直接跑 `python launcher.py`，或重新 `build.bat`
-- 首次上传是通过 GitHub API 完成的（本机到 github.com:443 的连接被重置）。远端历史从两次 API 提交开始，如果以后网络恢复、想让本地 git 历史与远端一致：
 
 ```bat
 git fetch origin main
