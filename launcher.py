@@ -41,7 +41,7 @@ LOG_PATH = DATA / "log.txt"
 MUTEX_NAME = "QuickLauncher_SingleInstance"
 
 APP_TITLE = "快捷启动台"
-APP_VER = "v1.6"
+APP_VER = "v1.7"
 
 # 深色科技风主题色板
 THEME = {
@@ -86,6 +86,8 @@ DEFAULT_CONFIG = {
         #     {"name": "编辑器", "path": "D:\\\\tools\\\\Code.exe", "stop": "Code.exe"},
         # ]},
     ],
+    # 全局保留应用: 切换模式时不会被停止 (填 exe 文件名), 例如 ["WeChat.exe", "chrome.exe"]
+    "global_keep": [],
 }
 
 
@@ -1234,7 +1236,7 @@ class QuickLauncher:
         self.icon = icon
         self.volume = Volume()
         self.config = self.load_config()
-        self.mode_pids = {}  # 模式名 -> {应用名: set(本次启动的 pid)}
+        self.mode_pids = {}  # 模式名 -> {exe 映像名: set(本次启动的 pid)}
         self.tk_queue = queue.Queue()  # 托盘线程 -> 编辑窗口线程 的命令队列
         self.tk_thread = None
         self.editor_win = None  # EditorWindow 实例 (由 tk 线程创建)
@@ -1373,8 +1375,9 @@ class QuickLauncher:
         if stop_name:
             time.sleep(1.5)
             new = self._proc_pids(stop_name) - before
+            key = (img or stop_name).lower()
             store = self.mode_pids.setdefault(mode_name, {})
-            store.setdefault(entry.get("name", "?"), set()).update(new)
+            store.setdefault(key, set()).update(new)
         return "ok"
 
     def start_mode(self, mode):
@@ -1414,11 +1417,15 @@ class QuickLauncher:
             mname = (mode or {}).get("name", "模式")
             store = self.mode_pids.get(mname, {})
             total = 0
+            keep_imgs = self._global_keep_images()
             for e in entries:
-                pids = store.get(e.get("name", "?"), set())
+                key = (entry_image(e) or e.get("name", "?")).lower()
+                if key in keep_imgs:
+                    continue
+                pids = store.get(key, set())
                 if pids:
                     total += self._kill_pids(pids)
-                    store[e.get("name", "?")] = set()
+                    store[key] = set()
             if total:
                 self.icon.notify("「%s」已停止 %d 个进程" % (mname, total), APP_TITLE)
             else:
@@ -1437,12 +1444,17 @@ class QuickLauncher:
         def run():
             mname = mode.get("name", "模式")
             store = self.mode_pids.get(mname, {})
-            pids = store.get(entry.get("name", "?"), set())
+            key = (entry_image(entry) or entry.get("name", "?")).lower()
+            if key in self._global_keep_images():
+                self.icon.notify("「%s」在全局保留列表里, 不会被停止" % entry.get("name", "?"),
+                                 APP_TITLE)
+                return
+            pids = store.get(key, set())
             if not pids:
                 self.icon.notify("「%s」没有记录到本次启动的进程" % entry.get("name", "?"), APP_TITLE)
                 return
             k = self._kill_pids(pids)
-            store[entry.get("name", "?")] = set()
+            store[key] = set()
             self.icon.notify("已停止「%s」%d 个进程" % (entry.get("name", "?"), k), APP_TITLE)
         self.spawn(run)
 
@@ -1510,8 +1522,29 @@ class QuickLauncher:
                 return m
         return None
 
+    def _global_keep_images(self):
+        """全局保留应用的 exe 映像名集合(小写)。配置里字符串或 {image} 字典都认。"""
+        out = set()
+        for it in (self.config.get("global_keep") or []):
+            img = ""
+            if isinstance(it, str):
+                img = it.strip()
+            elif isinstance(it, dict):
+                img = (it.get("image") or it.get("stop") or "").strip()
+                if not img:
+                    p = (it.get("path") or "").strip()
+                    if p:
+                        img = os.path.basename(p)
+            if not img:
+                continue
+            img = img.lower()
+            if "." not in img:
+                img += ".exe"
+            out.add(img)
+        return out
+
     def quick_switch(self, mode):
-        """右键托盘的快速切换: 停掉其他模式本次启动的进程(新模式也要用的保留)
+        """右键托盘的快速切换: 停掉不属于本模式的应用(全局保留 + 本模式要用的除外)
         → 应用显示/音量设置 → 启动本模式(已在运行的跳过)。"""
         def run():
             mname = (mode or {}).get("name", "模式")
@@ -1520,26 +1553,29 @@ class QuickLauncher:
                 img = entry_image(e).lower()
                 if img:
                     wanted[img] = True
-            stopped = kept = 0
+            keep = dict(wanted)
+            for img in self._global_keep_images():
+                keep.setdefault(img, True)
+            stopped_apps = stopped_pids = kept = 0
+            dst_store = self.mode_pids.setdefault(mname, {})
             for other, store in list(self.mode_pids.items()):
-                if other == mname:
-                    continue
-                other_mode = self._mode_by_name(other)
-                other_imgs = {}
-                for e in ((other_mode or {}).get("apps") or []):
-                    other_imgs[e.get("name", "?")] = entry_image(e).lower()
-                for app_name, pids in list(store.items()):
-                    if other_imgs.get(app_name) in wanted and pids:
-                        # 新模式也要用它: 不停止, 把归属转给新模式
-                        dst = self.mode_pids.setdefault(mname, {})
-                        dst.setdefault(app_name, set()).update(pids)
-                        store[app_name] = set()
-                        kept += 1
-                        log("mode switch kept running: %s" % app_name)
+                for img, pids in list(store.items()):
+                    if not pids:
                         continue
-                    if pids:
-                        stopped += self._kill_pids(pids)
-                    store[app_name] = set()
+                    if img in keep:
+                        # 本模式要用 / 全局保留: 不停止, 归属转给新模式, 之后仍能一键停止
+                        if other != mname:
+                            dst_store.setdefault(img, set()).update(pids)
+                            store[img] = set()
+                            kept += 1
+                            log("mode switch kept running: %s" % img)
+                        continue
+                    n = self._kill_pids(pids)
+                    if n:
+                        stopped_apps += 1
+                        stopped_pids += n
+                        log("mode switch stopped: %s (%d)" % (img, n))
+                    store[img] = set()
             msgs = self._apply_mode_settings(mode)
             entries = (mode or {}).get("apps") or []
             running = running_images()
@@ -1560,9 +1596,10 @@ class QuickLauncher:
             if msgs:
                 parts.append("已应用: " + "、".join(msgs))
             if kept:
-                parts.append("保留运行 %d 个(新模式也要用)" % kept)
-            if stopped:
-                parts.append("已停掉其他模式 %d 个进程" % stopped)
+                parts.append("保留运行 %d 个(本模式要用 / 全局保留)" % kept)
+            if stopped_pids:
+                parts.append("已停掉不属于本模式的 %d 个应用 / %d 个进程"
+                             % (stopped_apps, stopped_pids))
             try:
                 self.config["current_mode"] = mname
                 self.save_config()
@@ -2021,7 +2058,8 @@ class EditorWindow:
                      "btn_wshow", "lbl_wauth", "var_wauto",
                      "tv_lan", "lbl_lan_cur", "var_lanip", "var_lanmask",
                      "var_langw", "var_landns1", "var_landns2",
-                     "var_pool_search", "ent_pool_search", "lbl_pool_count"):
+                     "var_pool_search", "ent_pool_search", "lbl_pool_count",
+                     "var_global_keep", "ent_global_keep"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2390,6 +2428,17 @@ class EditorWindow:
                   text="先在左侧选中一个模式再填写; 音量留空 = 不修改音量。"
                   ).pack(anchor="w", pady=(2, 0))
 
+        row4 = ttk.Frame(right)
+        row4.pack(fill="x", pady=(4, 0))
+        ttk.Label(row4, text="🌍 全局保留应用 (切换模式时不停止):").pack(side="left")
+        self.var_global_keep = tk.StringVar()
+        self.ent_global_keep = ttk.Entry(row4, textvariable=self.var_global_keep, width=42)
+        self.ent_global_keep.pack(side="left", padx=(6, 6))
+        ttk.Button(row4, text="＋ 用应用库选中", command=self._keep_from_pool).pack(side="left")
+        ttk.Label(right, foreground=THEME["dim"],
+                  text="填 exe 文件名, 多个用逗号分隔 (例: chrome.exe, WeChat.exe); 保存后切换模式不会停掉它们。"
+                  ).pack(anchor="w", pady=(2, 0))
+
         pool = ttk.Frame(right)
         pool.pack(fill="x", pady=(8, 0))
         pool_head = ttk.Frame(pool)
@@ -2424,6 +2473,56 @@ class EditorWindow:
         pg.rowconfigure(0, weight=1)
         pg.columnconfigure(0, weight=1)
         return f
+
+    # ---------------- 全局保留 (切换模式不停止的应用)
+    def _parse_global_keep(self):
+        raw = (self.var_global_keep.get() or "")
+        for sep in ("，", "；", ";", "、", " "):
+            raw = raw.replace(sep, ",")
+        out, seen = [], set()
+        for piece in raw.split(","):
+            img = piece.strip().lower()
+            if not img:
+                continue
+            if "." not in img:
+                img += ".exe"
+            if img in seen:
+                continue
+            seen.add(img)
+            out.append(img)
+        return out
+
+    def _global_keep_text(self):
+        items = self.app.config.get("global_keep") or []
+        names = []
+        for it in items:
+            if isinstance(it, str):
+                names.append(it)
+            elif isinstance(it, dict):
+                names.append((it.get("image") or it.get("stop")
+                              or os.path.basename((it.get("path") or "").strip()) or ""))
+        return ", ".join([n for n in names if n])
+
+    def _keep_from_pool(self):
+        rows = getattr(self, "_pool_rows", None) or self.apps_work
+        sel = self.tv_pool.selection()
+        if not sel:
+            self.set_status("先在下方应用库里选中一条")
+            return
+        try:
+            entry = rows[self.tv_pool.index(sel[0])]
+        except Exception:
+            self.set_status("读取应用库失败")
+            return
+        img = entry_image(entry)
+        if not img:
+            self.set_status("这条应用拿不到 exe 名, 请手动填写")
+            return
+        cur = [x.strip() for x in (self.var_global_keep.get() or "").split(",") if x.strip()]
+        if img.lower() not in [c.lower() for c in cur]:
+            cur.append(img)
+            self.var_global_keep.set(", ".join(cur))
+        self.set_status("已加入全局保留: %s (记得点【保存并生效】)" % img)
 
     def _async(self, fn, done):
         """后台线程执行 fn(), 完成后由 tk 线程调用 done(结果)。
@@ -3113,6 +3212,10 @@ class EditorWindow:
             {"name": str(d.get("name", "")), "servers": list(d.get("servers") or [])}
             for d in (cfg.get("dns_presets") or []) if isinstance(d, dict)]
         self.var_proxy.set(str(cfg.get("proxy_server", "")))
+        try:
+            self.var_global_keep.set(self._global_keep_text())
+        except Exception:
+            log_exc()
         self.detected = []
         if APPS_DETECTED.exists():
             try:
@@ -3176,17 +3279,10 @@ class EditorWindow:
         self._fill_pool()
 
     def _mode_label(self, m):
-        """列表里模式名 + 已保存设置摘要。"""
+        """列表里显示模式名; 带显示/音量设置的模式加一个 ⚙ 标记(细节见右侧当前设置)。"""
         st = m.get("settings") or {}
-        bits = []
-        if st.get("volume") is not None:
-            bits.append("音量%d%%" % st["volume"])
-        d = st.get("display") or {}
-        if d.get("recommended"):
-            bits.append("显示:推荐")
-        elif d.get("w"):
-            bits.append("显示:%s×%s@%s" % (d["w"], d["h"], d["hz"]))
-        return m["name"] + ("  ⚙" + " ".join(bits) if bits else "")
+        has = bool(st.get("volume") is not None or (st.get("display") or {}))
+        return m["name"] + ("  ⚙" if has else "")
 
     def _fill_modes(self):
         self.lb_modes.delete(0, "end")
@@ -3597,6 +3693,7 @@ class EditorWindow:
             cfg["modes"] = self.modes_work
             cfg["proxy_server"] = self.var_proxy.get().strip()
             cfg["dns_presets"] = self.dns_work
+            cfg["global_keep"] = self._parse_global_keep()
             self.app.save_config(cfg)
             self.app.reload_config()
             self.set_status("✅ 已保存并生效 (托盘菜单已更新)")
