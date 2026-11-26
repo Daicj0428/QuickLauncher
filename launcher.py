@@ -2451,7 +2451,8 @@ class EditorWindow:
                   text="停止进程名留空 = 自动用 exe 文件名; 双击行可回填修改。"
                   ).pack(side="left", padx=10)
 
-        row3 = ttk.Frame(right)
+        self.row2_settings = row2
+        self.row3_settings = row3 = ttk.Frame(right)
         row3.pack(fill="x", pady=(0, 2))
         ttk.Label(row3, text="⚙ 启动本模式时自动应用设置:").pack(side="left")
         ttk.Label(row3, text="音量%").pack(side="left", padx=(10, 2))
@@ -2465,9 +2466,9 @@ class EditorWindow:
         self.btn_msave = ttk.Button(row3, text="💾 保存到模式",
                                     command=self._mode_settings_save)
         self.btn_msave.pack(side="left")
-        ttk.Label(right, foreground=THEME["dim"],
-                  text="先在左侧选中一个模式再填写; 音量留空 = 不修改音量。"
-                  ).pack(anchor="w", pady=(2, 0))
+        self.lbl_mset_hint = ttk.Label(right, foreground=THEME["dim"],
+                                       text="先在左侧选中一个模式再填写; 音量留空 = 不修改音量。")
+        self.lbl_mset_hint.pack(anchor="w", pady=(2, 0))
 
         ttk.Label(right, foreground=THEME["dim"],
                   text="🌍 左侧第一行是「全局模式」: 放进去的应用会被所有模式自动包含, "
@@ -3327,6 +3328,7 @@ class EditorWindow:
             self.lb_modes.insert("end", self._mode_label(m))
         self.lb_modes.selection_set(0)
         self._mode_selected()
+        self._apply_mode_settings_row_visibility()
 
     def _mode_selected(self, ev=None):
         # 切走前先保存上一个模式正在编辑的设置
@@ -3343,22 +3345,24 @@ class EditorWindow:
             # 全局模式: 不能单独存音量/显示设置, 它的应用会被所有模式带上
             self.cur_mode_idx_settings = None
             self._fill_mapps(list((self.global_mode_work or {}).get("apps") or []))
-            self.var_modevol.set("")
-            self.var_modedisp.set("不改显示")
-            for wdg in (self.ent_modevol, self.cb_modedisp, self.btn_msave):
-                try:
-                    wdg.state(["disabled"])
-                except Exception:
-                    pass
+            # 全局模式只有应用列表, 不显示音量/分辨率设置行
+            try:
+                self.row3_settings.pack_forget()
+                self.lbl_mset_hint.pack_forget()
+            except Exception:
+                pass
             self.lbl_msettings.config(
                 text="🌍 全局模式: 这里的应用会被所有其他模式自动包含, "
                      "启动/切换模式时一起启动, 且不会被切换停止")
             return
-        for wdg in (self.ent_modevol, self.cb_modedisp, self.btn_msave):
-            try:
-                wdg.state(["!disabled"])
-            except Exception:
-                pass
+        try:
+            if not self.row3_settings.winfo_ismapped():
+                self.row3_settings.pack(fill="x", pady=(0, 2), after=self.row2_settings)
+            if not self.lbl_mset_hint.winfo_ismapped():
+                self.lbl_mset_hint.pack(anchor="w", pady=(2, 0),
+                                        after=self.row3_settings)
+        except Exception:
+            pass
         i -= 1
         if 0 <= i < len(self.modes_work):
             self.cur_mode_idx_settings = i
@@ -3447,6 +3451,24 @@ class EditorWindow:
             return None
         i = sel[0] - 1
         return i if 0 <= i < len(self.modes_work) else None
+
+    def _apply_mode_settings_row_visibility(self):
+        """全局模式选中时隐藏"音量/分辨率设置"整行, 普通模式显示。"""
+        sel = self.lb_modes.curselection()
+        is_global = (not sel) or sel[0] == 0
+        try:
+            if is_global:
+                self.row3_settings.pack_forget()
+                self.lbl_mset_hint.pack_forget()
+            else:
+                if not self.row3_settings.winfo_ismapped():
+                    self.row3_settings.pack(fill="x", pady=(0, 2),
+                                            after=self.row2_settings)
+                if not self.lbl_mset_hint.winfo_ismapped():
+                    self.lbl_mset_hint.pack(anchor="w", pady=(2, 0),
+                                            after=self.row3_settings)
+        except Exception:
+            pass
 
     def _sel_mode_name(self):
         """当前选中项的名字(全局模式或普通模式)。"""
