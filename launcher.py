@@ -41,7 +41,8 @@ LOG_PATH = DATA / "log.txt"
 MUTEX_NAME = "QuickLauncher_SingleInstance"
 
 APP_TITLE = "快捷启动台"
-APP_VER = "v1.7"
+APP_VER = "v1.8"
+GLOBAL_MODE_NAME = "全局模式"
 
 # 深色科技风主题色板
 THEME = {
@@ -86,8 +87,10 @@ DEFAULT_CONFIG = {
         #     {"name": "编辑器", "path": "D:\\\\tools\\\\Code.exe", "stop": "Code.exe"},
         # ]},
     ],
-    # 全局保留应用: 切换模式时不会被停止 (填 exe 文件名), 例如 ["WeChat.exe", "chrome.exe"]
+    # 全局保留应用 (旧写法, 兼容用): 切换模式时不会被停止, 例如 ["WeChat.exe"]
     "global_keep": [],
+    # 全局模式: 所有其他模式都会自动包含它的应用, 启动/切换模式时一起启动, 且不会被停止
+    "global_mode": {"apps": []},
 }
 
 
@@ -1395,11 +1398,23 @@ class QuickLauncher:
                     skip += 1
                 else:
                     fail += 1
+            gok = gskip = 0
+            gapps = self.global_mode_apps()
+            if gapps:
+                gstore = self.mode_pids.setdefault(GLOBAL_MODE_NAME, {})
+                for e in gapps:
+                    r = self._launch_tracked(GLOBAL_MODE_NAME, e, running)
+                    if r == "ok":
+                        gok += 1
+                    elif r == "skip":
+                        gskip += 1
             parts = ["「%s」已启动 %d/%d 个应用" % (mname, ok, len(entries))]
             if skip:
                 parts.append("已在运行, 跳过 %d 个" % skip)
             if fail:
                 parts.append("启动失败 %d 个" % fail)
+            if gok or gskip:
+                parts.append("全局模式 %d 个应用已就绪" % (gok + gskip))
             if msgs:
                 parts.append("已应用: " + "、".join(msgs))
             try:
@@ -1522,9 +1537,19 @@ class QuickLauncher:
                 return m
         return None
 
+    def global_mode_apps(self):
+        """全局模式的应用列表(所有模式都会自动带上它们)。"""
+        gm = self.config.get("global_mode") or {}
+        apps = gm.get("apps") if isinstance(gm, dict) else None
+        return [a for a in (apps or []) if isinstance(a, dict)]
+
     def _global_keep_images(self):
-        """全局保留应用的 exe 映像名集合(小写)。配置里字符串或 {image} 字典都认。"""
+        """切换模式时不会被停止的 exe 映像名集合(小写): 全局模式的应用 + 旧的 global_keep。"""
         out = set()
+        for e in self.global_mode_apps():
+            img = entry_image(e).lower()
+            if img:
+                out.add(img)
         for it in (self.config.get("global_keep") or []):
             img = ""
             if isinstance(it, str):
@@ -1588,11 +1613,23 @@ class QuickLauncher:
                     skip += 1
                 else:
                     fail += 1
+            gok = gskip = 0
+            gapps = self.global_mode_apps()
+            if gapps:
+                gstore = self.mode_pids.setdefault(GLOBAL_MODE_NAME, {})
+                for e in gapps:
+                    r = self._launch_tracked(GLOBAL_MODE_NAME, e, running)
+                    if r == "ok":
+                        gok += 1
+                    elif r == "skip":
+                        gskip += 1
             parts = ["「%s」已启动 %d/%d 个应用" % (mname, ok, len(entries))]
             if skip:
                 parts.append("已在运行, 跳过 %d 个" % skip)
             if fail:
                 parts.append("启动失败 %d 个" % fail)
+            if gok or gskip:
+                parts.append("全局模式 %d 个应用已就绪" % (gok + gskip))
             if msgs:
                 parts.append("已应用: " + "、".join(msgs))
             if kept:
@@ -2009,7 +2046,8 @@ class EditorWindow:
         self.dns_work = []
         self.detected = []
         self.detected_names = []
-        self.cur_mode_idx_settings = None  # 当前正在编辑设置的模式索引
+        self.cur_mode_idx_settings = None   # 当前正在编辑设置的模式索引
+        self.global_mode_work = {"apps": []}   # 全局模式的应用(所有模式自动包含)
         self._icon_cache = {}              # 应用路径 -> PhotoImage (带缓存)
         self._default_icon = None
         self._done_q = queue.Queue()       # 后台线程 -> tk 线程的结果队列
@@ -2059,7 +2097,7 @@ class EditorWindow:
                      "tv_lan", "lbl_lan_cur", "var_lanip", "var_lanmask",
                      "var_langw", "var_landns1", "var_landns2",
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
-                     "var_global_keep", "ent_global_keep"):
+                     "global_mode_work"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2418,25 +2456,22 @@ class EditorWindow:
         ttk.Label(row3, text="⚙ 启动本模式时自动应用设置:").pack(side="left")
         ttk.Label(row3, text="音量%").pack(side="left", padx=(10, 2))
         self.var_modevol = tk.StringVar()
-        ttk.Entry(row3, textvariable=self.var_modevol, width=6).pack(side="left")
+        self.ent_modevol = ttk.Entry(row3, textvariable=self.var_modevol, width=6)
+        self.ent_modevol.pack(side="left")
         self.var_modedisp = tk.StringVar()
         self.cb_modedisp = ttk.Combobox(row3, textvariable=self.var_modedisp,
                                         width=26, state="readonly")
         self.cb_modedisp.pack(side="left", padx=(10, 4))
-        ttk.Button(row3, text="💾 保存到模式", command=self._mode_settings_save).pack(side="left")
+        self.btn_msave = ttk.Button(row3, text="💾 保存到模式",
+                                    command=self._mode_settings_save)
+        self.btn_msave.pack(side="left")
         ttk.Label(right, foreground=THEME["dim"],
                   text="先在左侧选中一个模式再填写; 音量留空 = 不修改音量。"
                   ).pack(anchor="w", pady=(2, 0))
 
-        row4 = ttk.Frame(right)
-        row4.pack(fill="x", pady=(4, 0))
-        ttk.Label(row4, text="🌍 全局保留应用 (切换模式时不停止):").pack(side="left")
-        self.var_global_keep = tk.StringVar()
-        self.ent_global_keep = ttk.Entry(row4, textvariable=self.var_global_keep, width=42)
-        self.ent_global_keep.pack(side="left", padx=(6, 6))
-        ttk.Button(row4, text="＋ 用应用库选中", command=self._keep_from_pool).pack(side="left")
         ttk.Label(right, foreground=THEME["dim"],
-                  text="填 exe 文件名, 多个用逗号分隔 (例: chrome.exe, WeChat.exe); 保存后切换模式不会停掉它们。"
+                  text="🌍 左侧第一行是「全局模式」: 放进去的应用会被所有模式自动包含, "
+                       "启动/切换模式时一起启动, 且不会被切换停止。"
                   ).pack(anchor="w", pady=(2, 0))
 
         pool = ttk.Frame(right)
@@ -2474,7 +2509,7 @@ class EditorWindow:
         pg.columnconfigure(0, weight=1)
         return f
 
-    # ---------------- 全局保留 (切换模式不停止的应用)
+    # ---------------- 全局保留 (旧接口, 保留供配置兼容)
     def _parse_global_keep(self):
         raw = (self.var_global_keep.get() or "")
         for sep in ("，", "；", ";", "、", " "):
@@ -3212,10 +3247,10 @@ class EditorWindow:
             {"name": str(d.get("name", "")), "servers": list(d.get("servers") or [])}
             for d in (cfg.get("dns_presets") or []) if isinstance(d, dict)]
         self.var_proxy.set(str(cfg.get("proxy_server", "")))
-        try:
-            self.var_global_keep.set(self._global_keep_text())
-        except Exception:
-            log_exc()
+        gm = cfg.get("global_mode") or {}
+        self.global_mode_work = {
+            "apps": [dict(e) for e in ((gm.get("apps") if isinstance(gm, dict) else None) or [])
+                     if isinstance(e, dict)]}
         self.detected = []
         if APPS_DETECTED.exists():
             try:
@@ -3286,13 +3321,12 @@ class EditorWindow:
 
     def _fill_modes(self):
         self.lb_modes.delete(0, "end")
+        n_global = len((self.global_mode_work or {}).get("apps") or [])
+        self.lb_modes.insert("end", "🌍 %s (%d)" % (GLOBAL_MODE_NAME, n_global))
         for m in self.modes_work:
             self.lb_modes.insert("end", self._mode_label(m))
-        if self.modes_work:
-            self.lb_modes.selection_set(0)
-            self._mode_selected()
-        else:
-            self._fill_mapps([])
+        self.lb_modes.selection_set(0)
+        self._mode_selected()
 
     def _mode_selected(self, ev=None):
         # 切走前先保存上一个模式正在编辑的设置
@@ -3305,6 +3339,27 @@ class EditorWindow:
             self.lbl_msettings.config(text="左侧选中一个模式, 即可保存它的音量 / 分辨率设置")
             return
         i = sel[0]
+        if i == 0:
+            # 全局模式: 不能单独存音量/显示设置, 它的应用会被所有模式带上
+            self.cur_mode_idx_settings = None
+            self._fill_mapps(list((self.global_mode_work or {}).get("apps") or []))
+            self.var_modevol.set("")
+            self.var_modedisp.set("不改显示")
+            for wdg in (self.ent_modevol, self.cb_modedisp, self.btn_msave):
+                try:
+                    wdg.state(["disabled"])
+                except Exception:
+                    pass
+            self.lbl_msettings.config(
+                text="🌍 全局模式: 这里的应用会被所有其他模式自动包含, "
+                     "启动/切换模式时一起启动, 且不会被切换停止")
+            return
+        for wdg in (self.ent_modevol, self.cb_modedisp, self.btn_msave):
+            try:
+                wdg.state(["!disabled"])
+            except Exception:
+                pass
+        i -= 1
         if 0 <= i < len(self.modes_work):
             self.cur_mode_idx_settings = i
             self._fill_mapps(self.modes_work[i]["apps"])
@@ -3368,12 +3423,13 @@ class EditorWindow:
         # 只更新这一行的文字; 绝不能抢走用户当前的选中项, 否则新建模式无法切换选中
         try:
             new_label = self._mode_label(self.modes_work[i])
-            if self.lb_modes.get(i) != new_label:
+            k = i + 1          # 列表第 0 行固定是全局模式
+            if self.lb_modes.get(k) != new_label:
                 sel = list(self.lb_modes.curselection())
                 self.lb_modes.unbind("<<ListboxSelect>>")
                 try:
-                    self.lb_modes.delete(i)
-                    self.lb_modes.insert(i, new_label)
+                    self.lb_modes.delete(k)
+                    self.lb_modes.insert(k, new_label)
                     for s in sel:
                         self.lb_modes.selection_set(s)
                 finally:
@@ -3385,11 +3441,36 @@ class EditorWindow:
                             self.modes_work[i]["name"])
 
     def _cur_mode_idx(self):
+        """当前选中的【普通模式】下标(全局模式返回 None)。"""
+        sel = self.lb_modes.curselection()
+        if not sel or sel[0] == 0:
+            return None
+        i = sel[0] - 1
+        return i if 0 <= i < len(self.modes_work) else None
+
+    def _sel_mode_name(self):
+        """当前选中项的名字(全局模式或普通模式)。"""
+        sel = self.lb_modes.curselection()
+        if not sel:
+            return ""
+        if sel[0] == 0:
+            return "🌍 " + GLOBAL_MODE_NAME
+        i = sel[0] - 1
+        if 0 <= i < len(self.modes_work):
+            return self.modes_work[i].get("name", "")
+        return ""
+
+    def _sel_apps(self):
+        """当前选中项的应用列表(全局模式或普通模式); 未选中返回 None。"""
         sel = self.lb_modes.curselection()
         if not sel:
             return None
-        i = sel[0]
-        return i if 0 <= i < len(self.modes_work) else None
+        if sel[0] == 0:
+            return (self.global_mode_work or {}).get("apps")
+        i = sel[0] - 1
+        if 0 <= i < len(self.modes_work):
+            return self.modes_work[i]["apps"]
+        return None
 
     def _fill_mapps(self, apps):
         self.tv_mapps.delete(*self.tv_mapps.get_children())
@@ -3452,15 +3533,14 @@ class EditorWindow:
             rows = self.apps_work
         if not (0 <= j < len(rows)):
             return
-        i = self._cur_mode_idx()
-        if i is None:
+        apps = self._sel_apps()
+        if apps is None:
             self.set_status("⚠ 先在左侧选中一个模式, 再单击应用库里的图标")
             return
         a = rows[j]
         path = (a.get("path") or "").strip()
         if not path:
             return
-        apps = self.modes_work[i]["apps"]
         if any((e.get("path") or "").strip() == path for e in apps):
             self.set_status("「%s」已在该模式中" % (a.get("name") or path))
             return
@@ -3471,8 +3551,8 @@ class EditorWindow:
             self.tv_pool.selection_remove(sel[0])
         except Exception:
             pass
-        self.set_status("✅ 已把「%s」加入模式「%s」, 点【💾 保存并生效】" %
-                        (name, self.modes_work[i]["name"]))
+        mode_name = (self._sel_mode_name() or "模式")
+        self.set_status("✅ 已把「%s」加入「%s」, 点【💾 保存并生效】" % (name, mode_name))
 
     def _fill_dns(self):
         self.tv_dns.delete(*self.tv_dns.get_children())
@@ -3522,12 +3602,11 @@ class EditorWindow:
             self.var_path.set(a.get("path", ""))
 
     def _mapp_fill(self, ev=None):
-        i = self._cur_mode_idx()
+        apps = self._sel_apps()
         sel = self.tv_mapps.selection()
-        if i is None or not sel:
+        if apps is None or not sel:
             return
         j = self.tv_mapps.index(sel[0])
-        apps = self.modes_work[i]["apps"]
         if 0 <= j < len(apps):
             e = apps[j]
             self.var_mname.set(e.get("name", ""))
@@ -3580,7 +3659,7 @@ class EditorWindow:
             self.modes_work.append({"name": name.strip(), "apps": [], "settings": {}})
             self._fill_modes()
             self.lb_modes.selection_clear(0, "end")
-            self.lb_modes.selection_set(len(self.modes_work) - 1)
+            self.lb_modes.selection_set(len(self.modes_work))
             self._mode_selected()
             self.set_status("已添加模式【%s】, 点保存" % name.strip())
 
@@ -3588,21 +3667,21 @@ class EditorWindow:
         from tkinter import simpledialog
         i = self._cur_mode_idx()
         if i is None:
-            self.set_status("⚠ 先在左侧选中一个模式")
+            self.set_status("⚠ 选中左侧一个普通模式才能重命名 (全局模式不用改名)")
             return
         old = self.modes_work[i]["name"]
         name = simpledialog.askstring("重命名模式", "新名称:", initialvalue=old, parent=self.root)
         if name and name.strip():
             self.modes_work[i]["name"] = name.strip()
             self._fill_modes()
-            self.lb_modes.selection_set(i)
+            self.lb_modes.selection_set(i + 1)
             self._mode_selected()
             self.set_status("已重命名, 点保存")
 
     def _mode_del(self):
         i = self._cur_mode_idx()
         if i is None:
-            self.set_status("⚠ 先在左侧选中一个模式")
+            self.set_status("⚠ 全局模式不能删除 (选中一个普通模式再删)")
             return
         name = self.modes_work[i]["name"]
         self.cur_mode_idx_settings = None   # 防止把设置错存到被删除后顶位的模式
@@ -3611,8 +3690,8 @@ class EditorWindow:
         self.set_status("已删除模式【%s】, 点保存" % name)
 
     def _mapp_add(self):
-        i = self._cur_mode_idx()
-        if i is None:
+        apps = self._sel_apps()
+        if apps is None:
             self.set_status("⚠ 先在左侧选中一个模式")
             return
         name = self.var_mname.get().strip()
@@ -3627,11 +3706,10 @@ class EditorWindow:
         sel = self.tv_mapps.selection()
         if sel:
             j = self.tv_mapps.index(sel[0])
-            apps = self.modes_work[i]["apps"]
             if 0 <= j < len(apps):
                 apps[j] = entry
         else:
-            self.modes_work[i]["apps"].append(entry)
+            apps.append(entry)
         self._mode_selected()
         self.var_mname.set("")
         self.var_mpath.set("")
@@ -3639,13 +3717,12 @@ class EditorWindow:
         self.set_status("已改动, 点【💾 保存并生效】")
 
     def _mapp_del(self):
-        i = self._cur_mode_idx()
+        apps = self._sel_apps()
         sel = self.tv_mapps.selection()
-        if i is None or not sel:
+        if apps is None or not sel:
             self.set_status("⚠ 先选中模式和应用行")
             return
         j = self.tv_mapps.index(sel[0])
-        apps = self.modes_work[i]["apps"]
         if 0 <= j < len(apps):
             apps.pop(j)
         self._mode_selected()
@@ -3693,7 +3770,7 @@ class EditorWindow:
             cfg["modes"] = self.modes_work
             cfg["proxy_server"] = self.var_proxy.get().strip()
             cfg["dns_presets"] = self.dns_work
-            cfg["global_keep"] = self._parse_global_keep()
+            cfg["global_mode"] = {"apps": list(self.global_mode_work.get("apps") or [])}
             self.app.save_config(cfg)
             self.app.reload_config()
             self.set_status("✅ 已保存并生效 (托盘菜单已更新)")
