@@ -1215,48 +1215,43 @@ def _wlan_handle():
         return None, None
 
 
-def wifi_radio_on():
-    """WiFi 软件无线电状态: True=开, False=关, None=未知/失败。"""
-    h, g = _wlan_handle()
-    if h is None or g is None:
-        return None
+def wifi_adapter_name():
+    """返回 WiFi 无线适配器名 (通常 'WLAN')。"""
     try:
-        w = _wlan_dll()
-        data = wintypes.LPVOID()
-        typ = wintypes.DWORD()
-        if w.WlanQueryInterface(h, ctypes.byref(g), 4, None, ctypes.byref(typ),
-                                ctypes.byref(data), None) != 0 or not data:
-            return None
-        st = ctypes.cast(data, ctypes.POINTER(_WLAN_PHY_RADIO_STATE)).contents
-        return st.dot11SoftwareRadioState == 0
+        _, _, ifname = wlan_ifaces_state()
+        if ifname:
+            return ifname
     except Exception:
+        pass
+    return "WLAN"
+
+
+def wifi_radio_on():
+    """WiFi 是否开启 (按 WLAN 适配器的管理员状态)。True=开, False=关, None=未知。"""
+    name = wifi_adapter_name()
+    rc, t = _netsh(["interface", "show", "interface"])
+    if rc != 0:
         return None
-    finally:
-        try:
-            _wlan_dll().WlanCloseHandle(h, None)
-        except Exception:
-            pass
+    for raw in t.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if " ".join(parts[3:]) == name:
+            admin = parts[0].strip()
+            if "启用" in admin or admin.lower() == "enabled":
+                return True
+            if "禁用" in admin or admin.lower() == "disabled":
+                return False
+    return None
 
 
 def wifi_set_radio(on):
-    """切换 WiFi 软件无线电。返回是否成功。"""
-    h, g = _wlan_handle()
-    if h is None or g is None:
-        return False
-    try:
-        w = _wlan_dll()
-        st = _WLAN_PHY_RADIO_STATE()
-        st.dot11SoftwareRadioState = 0 if on else 1
-        rc = w.WlanSetInterface(h, ctypes.byref(g), 4, ctypes.sizeof(st),
-                                ctypes.byref(st), None)
-        return rc == 0
-    except Exception:
-        return False
-    finally:
-        try:
-            _wlan_dll().WlanCloseHandle(h, None)
-        except Exception:
-            pass
+    """开关 WiFi (禁用/启用 WLAN 适配器)。返回是否成功。"""
+    ok, _ = adapter_enable(wifi_adapter_name(), on)
+    return ok
 
 
 def _disk_snapshot():
@@ -2697,7 +2692,7 @@ class EditorWindow:
                      "tv_lan", "lbl_lan_cur", "var_lanip", "var_lanmask",
                      "var_langw", "var_landns1", "var_landns2",
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
-                     "global_mode_work", "tv_scan", "btn_scan_toggle", "scan_body",
+                     "global_mode_work", "tv_scan", "scan_body", "btn_saved_toggle", "saved_body",
                      "lbl_scan", "txt_sys", "tv_res",
                      "btn_wifi_radio", "var_autorefresh", "lbl_net_rate"):
             try:
@@ -3218,17 +3213,56 @@ class EditorWindow:
         self.btn_wifi_radio.pack(side="left")
         ttk.Label(rhead, foreground=THEME["dim"],
                   text="一键开启 / 关闭 WiFi 无线开关").pack(side="left", padx=8)
-        top = ttk.Frame(f)
+
+        # ---- 主区: 附近 WiFi (扫描)
+        main = ttk.Frame(f)
+        main.pack(fill="both", expand=True)
+        ttk.Label(main, text="📡 附近 WiFi (双击连接; 已保存的网络不在此列)").pack(anchor="w")
+        self.lbl_scan = ttk.Label(main, text="", foreground=THEME["dim"])
+        self.lbl_scan.pack(anchor="w")
+        sg = ttk.Frame(main)
+        sg.pack(fill="both", expand=True, pady=4)
+        self.tv_scan = ttk.Treeview(sg, columns=("ssid", "signal", "auth", "band"),
+                                    show="headings", height=6)
+        self.tv_scan.heading("ssid", text="SSID")
+        self.tv_scan.heading("signal", text="信号")
+        self.tv_scan.heading("auth", text="加密")
+        self.tv_scan.heading("band", text="频段/通道")
+        self.tv_scan.column("ssid", width=260, anchor="w")
+        self.tv_scan.column("signal", width=70, anchor="w")
+        self.tv_scan.column("auth", width=140, anchor="w")
+        self.tv_scan.column("band", width=120, anchor="w")
+        self.tv_scan.bind("<Double-1>", lambda e: self._wifi_scan_connect())
+        ssb = ttk.Scrollbar(sg, orient="vertical", command=self.tv_scan.yview)
+        self.tv_scan.configure(yscrollcommand=ssb.set)
+        self.tv_scan.grid(row=0, column=0, sticky="nsew")
+        ssb.grid(row=0, column=1, sticky="ns")
+        sg.rowconfigure(0, weight=1)
+        sg.columnconfigure(0, weight=1)
+        srow = ttk.Frame(main)
+        srow.pack(fill="x", pady=(4, 0))
+        ttk.Button(srow, text="🌀 重新扫描", command=self._wifi_scan_load).pack(side="left")
+        ttk.Button(srow, text="📡 连接所选",
+                   command=self._wifi_scan_connect).pack(side="left", padx=6)
+        ttk.Label(srow, foreground=THEME["dim"],
+                  text="未保存的网络双击=连接(会询问密码); 扫描需无线网卡可用。"
+                  ).pack(side="left", padx=10)
+
+        # ---- 已保存 WiFi 折叠区
+        self.btn_saved_toggle = ttk.Button(
+            f, text="💾 已保存的 WiFi 配置  ▶", command=self._wifi_saved_toggle)
+        self.btn_saved_toggle.pack(fill="x", pady=(10, 0))
+        self.saved_body = ttk.Frame(f)
+        top = ttk.Frame(self.saved_body)
         top.pack(fill="both", expand=True)
         left = ttk.Frame(top)
         left.pack(side="left", fill="both", expand=True)
-        ttk.Label(left, text="已保存的 WiFi 配置 (双击 = 连接)").pack(anchor="w")
         self.lbl_wifi_head = ttk.Label(left, text="", foreground=THEME["accent"])
         self.lbl_wifi_head.pack(anchor="w")
         g = ttk.Frame(left)
         g.pack(fill="both", expand=True, pady=4)
         self.tv_wifi = ttk.Treeview(g, columns=("ssid", "state"),
-                                    show="headings", height=8)
+                                    show="headings", height=7)
         self.tv_wifi.heading("ssid", text="WiFi 名称 (SSID)")
         self.tv_wifi.heading("state", text="状态")
         self.tv_wifi.column("ssid", width=280, anchor="w")
@@ -3276,45 +3310,8 @@ class EditorWindow:
         ttk.Button(brow, text="📄 原始配置",
                    command=self._wifi_raw).pack(side="left", padx=8)
         ttk.Label(det, foreground=THEME["dim"], justify="left",
-                  text="• 密码留空 = 不修改密码\n"
-                       "• 保存后重新连接该 WiFi 才生效"
+                  text="• 密码留空 = 不修改密码; 保存后重新连接该 WiFi 才生效"
                   ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        # ---- 附近 WiFi (未保存的网络) 折叠区
-        self.btn_scan_toggle = ttk.Button(
-            f, text="📡 附近 WiFi (扫描到未保存的网络)  ▶",
-            command=self._wifi_scan_toggle)
-        self.btn_scan_toggle.pack(fill="x", pady=(10, 0))
-        self.scan_body = ttk.Frame(f)
-        self.lbl_scan = ttk.Label(self.scan_body, text="", foreground=THEME["dim"])
-        self.lbl_scan.pack(anchor="w")
-        sg = ttk.Frame(self.scan_body)
-        sg.pack(fill="both", expand=True, pady=4)
-        self.tv_scan = ttk.Treeview(sg, columns=("ssid", "signal", "auth", "band"),
-                                    show="headings", height=5)
-        self.tv_scan.heading("ssid", text="SSID")
-        self.tv_scan.heading("signal", text="信号")
-        self.tv_scan.heading("auth", text="加密")
-        self.tv_scan.heading("band", text="频段/通道")
-        self.tv_scan.column("ssid", width=260, anchor="w")
-        self.tv_scan.column("signal", width=70, anchor="w")
-        self.tv_scan.column("auth", width=140, anchor="w")
-        self.tv_scan.column("band", width=120, anchor="w")
-        self.tv_scan.bind("<Double-1>", lambda e: self._wifi_scan_connect())
-        ssb = ttk.Scrollbar(sg, orient="vertical", command=self.tv_scan.yview)
-        self.tv_scan.configure(yscrollcommand=ssb.set)
-        self.tv_scan.grid(row=0, column=0, sticky="nsew")
-        ssb.grid(row=0, column=1, sticky="ns")
-        sg.rowconfigure(0, weight=1)
-        sg.columnconfigure(0, weight=1)
-        srow = ttk.Frame(self.scan_body)
-        srow.pack(fill="x", pady=(4, 0))
-        ttk.Button(srow, text="🌀 重新扫描", command=self._wifi_scan_load).pack(side="left")
-        ttk.Button(srow, text="📡 连接所选",
-                   command=self._wifi_scan_connect).pack(side="left", padx=6)
-        ttk.Label(srow, foreground=THEME["dim"],
-                  text="未保存的网络双击=连接(会询问密码); 扫描需无线网卡可用。"
-                  ).pack(side="left", padx=10)
         return f
 
     # ---------------- 网络: 以太网 / 网卡子页
@@ -3445,8 +3442,9 @@ class EditorWindow:
                 self.btn_wifi_radio.configure(text="WiFi: ⛔ 已关闭 (点击开启)")
             else:
                 self.btn_wifi_radio.configure(text="WiFi: 状态未知 (点击切换)")
+            return st
         except Exception:
-            pass
+            return None
 
     def _wifi_radio_toggle(self):
         cur = wifi_radio_on()
@@ -3518,8 +3516,14 @@ class EditorWindow:
                 return
             self._wifi_fill(rows_w, connected, ssid)
             self._lan_fill(rows_l)
+            st = None
             try:
-                self._wifi_radio_refresh()
+                st = self._wifi_radio_refresh()
+            except Exception:
+                pass
+            try:
+                if st is True and not self.tv_scan.get_children():
+                    self._wifi_scan_load()
             except Exception:
                 pass
 
@@ -3620,15 +3624,13 @@ class EditorWindow:
         t.insert("1.0", txt)
 
     # ---------------- 网络: 附近 WiFi 扫描
-    def _wifi_scan_toggle(self):
-        if self.scan_body.winfo_ismapped():
-            self.scan_body.pack_forget()
-            self.btn_scan_toggle.configure(text="📡 附近 WiFi (扫描到未保存的网络)  ▶")
+    def _wifi_saved_toggle(self):
+        if self.saved_body.winfo_ismapped():
+            self.saved_body.pack_forget()
+            self.btn_saved_toggle.configure(text="💾 已保存的 WiFi 配置  ▶")
         else:
-            self.scan_body.pack(fill="both", expand=True)
-            self.btn_scan_toggle.configure(text="📡 附近 WiFi (扫描到未保存的网络)  ▼")
-            if not self.tv_scan.get_children():
-                self._wifi_scan_load()
+            self.saved_body.pack(fill="both", expand=True)
+            self.btn_saved_toggle.configure(text="💾 已保存的 WiFi 配置  ▼")
 
     def _wifi_scan_load(self):
         self.lbl_scan.configure(text="正在扫描附近 WiFi…")
