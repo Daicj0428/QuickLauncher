@@ -1025,6 +1025,280 @@ def collect_system():
     return info
 
 
+
+def _reg_val(key, sub, name):
+    try:
+        import winreg
+        with winreg.OpenKey(key, sub) as k:
+            v, _ = winreg.QueryValueEx(k, name)
+            return v
+    except Exception:
+        return None
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def memory_info():
+    try:
+        m = _MEMORYSTATUSEX()
+        m.dwLength = sizeof(m)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(byref(m)):
+            return None
+        return {"total": m.ullTotalPhys, "avail": m.ullAvailPhys,
+                "load": m.dwMemoryLoad}
+    except Exception:
+        return None
+
+
+def storage_info():
+    drives = []
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        mask = 0
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        letter = chr(65 + i) + ":\\"
+        try:
+            t = ctypes.windll.kernel32.GetDriveTypeW(letter)
+            free = ctypes.c_ulonglong(0)
+            total = ctypes.c_ulonglong(0)
+            total_free = ctypes.c_ulonglong(0)
+            if not ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    letter, byref(free), byref(total), byref(total_free)):
+                continue
+            label = ""
+            try:
+                buf = ctypes.create_unicode_buffer(256)
+                if ctypes.windll.kernel32.GetVolumeInformationW(
+                        letter, buf, 256, None, None, None, None, 0):
+                    label = buf.value
+            except Exception:
+                pass
+            drives.append({"letter": letter, "label": label, "type": t,
+                           "total": total.value, "free": total_free.value})
+        except Exception:
+            continue
+    return drives
+
+
+def cpu_info():
+    import winreg
+    name = _reg_val(winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                    "ProcessorNameString")
+    mhz = _reg_val(winreg.HKEY_LOCAL_MACHINE,
+                   r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "~MHz")
+    return {"name": name or "未知", "mhz": mhz, "logical": os.cpu_count() or 0}
+
+
+def gpu_info():
+    rows = []
+    try:
+        out = ps("Get-CimInstance Win32_VideoController | ForEach-Object { "
+                 "\"$($_.Name)|$($_.AdapterRAM)|$($_.DriverVersion)\" }")
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or "virtual" in line.lower():
+                continue
+            parts = line.split("|")
+            name = parts[0].strip() if parts and parts[0].strip() else "未知"
+            # 注: Win32_VideoController.AdapterRAM 是 32 位值, >4GB 显存会截断失真,
+            # 故不展示显存大小, 只给名称 + 驱动版本。
+            drv = parts[2].strip() if len(parts) > 2 else ""
+            rows.append({"name": name, "driver": drv})
+    except Exception:
+        pass
+    return rows
+
+
+def os_info():
+    import winreg
+    k = winreg.HKEY_LOCAL_MACHINE
+    base = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    osname = (_reg_val(k, base, "ProductName") or platform.system())
+    disp = _reg_val(k, base, "DisplayVersion") or ""
+    build = _reg_val(k, base, "CurrentBuild") or ""
+    return {"name": osname, "display": disp, "build": build,
+            "arch": platform.machine(),
+            "node": os.environ.get("COMPUTERNAME", ""),
+            "user": os.environ.get("USERNAME", "")}
+
+
+def collect_system_detailed():
+    return {"os": os_info(), "cpu": cpu_info(), "gpu": gpu_info(),
+            "mem": memory_info(), "disks": storage_info(),
+            "py": platform.python_version()}
+
+
+def _gb(n):
+    return "%.1f GB" % (n / 1073741824.0)
+
+
+def format_system_info(d):
+    L = []
+    osd = d.get("os") or {}
+    L.append("【操作系统】")
+    L.append("  系统: %s %s (Build %s)" % (osd.get("name") or "?",
+                                          osd.get("display") or "",
+                                          osd.get("build") or ""))
+    L.append("  架构: %s    计算机名: %s    用户: %s"
+             % (osd.get("arch") or "?", osd.get("node") or "?",
+                osd.get("user") or "?"))
+    c = d.get("cpu") or {}
+    L.append("")
+    L.append("【处理器】")
+    L.append("  %s" % (c.get("name") or "?"))
+    L.append("  逻辑核心: %d    频率: %s MHz" % (c.get("logical") or 0,
+                                                 c.get("mhz") or "?"))
+    L.append("")
+    L.append("【显卡】")
+    gpus = d.get("gpu") or []
+    if gpus:
+        for g in gpus:
+            L.append("  %s%s" % (g.get("name") or "?",
+                                (" · 驱动 " + g["driver"]) if g.get("driver") else ""))
+    else:
+        L.append("  (未获取到)")
+    m = d.get("mem")
+    L.append("")
+    L.append("【内存】")
+    if m:
+        L.append("  总内存: %s    可用: %s    使用率: %d%%"
+                 % (_gb(m["total"]), _gb(m["avail"]), m["load"]))
+    else:
+        L.append("  (未获取到)")
+    L.append("")
+    L.append("【存储】")
+    disks = d.get("disks") or []
+    if disks:
+        for s in disks:
+            tt = {2: "可移动", 3: "本地磁盘", 4: "网络", 5: "光驱",
+                  6: "RAM 盘"}.get(s["type"], "磁盘")
+            L.append("  %s [%s] %s    共 %s    可用 %s"
+                     % (s["letter"], tt, s["label"] or "",
+                        _gb(s["total"]), _gb(s["free"])))
+    else:
+        L.append("  (未获取到)")
+    L.append("")
+    L.append("【运行环境】")
+    L.append("  Python %s · %s" % (d.get("py") or "?", platform.platform()))
+    return "\n".join(L)
+
+
+def _xml_escape(v):
+    return (str(v).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def wifi_scan_networks():
+    """扫描附近可见 WiFi, 只返回未保存的网络, 按信号降序:
+    [{'ssid','signal','auth','band'}]。"""
+    saved = {r["name"] for r in wifi_profiles_status()}
+    rc, t = _netsh(["wlan", "show", "networks", "mode=bssid"])
+    nets, cur = [], None
+    for raw in t.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("SSID ") and ":" in line:
+            nm = line.split(":", 1)[1].strip()
+            if cur and cur.get("ssid"):
+                nets.append(cur)
+            cur = {"ssid": nm, "signal": None, "auth": "", "band": "",
+                   "channel": None, "radio": ""}
+        elif cur is not None and ":" in line:
+            k, v = line.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k in ("身份验证", "Authentication"):
+                if not cur["auth"]:
+                    cur["auth"] = v
+            elif k in ("加密", "Encryption"):
+                if not cur["auth"]:
+                    cur["auth"] = v
+            elif k in ("信号", "Signal"):
+                try:
+                    sig = int(v.replace("%", "").strip())
+                except Exception:
+                    sig = None
+                if sig is not None and (cur["signal"] is None or sig > cur["signal"]):
+                    cur["signal"] = sig
+            elif k in ("通道", "Channel"):
+                if not cur["channel"]:
+                    try:
+                        cur["channel"] = int(v.strip())
+                    except Exception:
+                        pass
+            elif k in ("无线电类型", "Radio type"):
+                if not cur["radio"]:
+                    cur["radio"] = v
+    if cur and cur.get("ssid"):
+        nets.append(cur)
+
+    out, seen = [], set()
+    for n in nets:
+        name = n["ssid"]
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if name in saved:
+            continue
+        ch = n.get("channel")
+        if ch:
+            band = ("5G" if ch > 14 else "2.4G") + (" · ch%s" % ch)
+        else:
+            band = n.get("radio") or ""
+        out.append({"ssid": name, "signal": n.get("signal"),
+                    "auth": n.get("auth") or "开放", "band": band})
+    out.sort(key=lambda x: -(x.get("signal") or 0))
+    return out
+
+
+def wifi_connect_new(ssid, password="", auth=""):
+    """给未保存的网络生成配置文件并连接(开放网络无需密码)。"""
+    sec = ""
+    if auth and ("开放" not in auth and "Open" not in auth):
+        aut, enc = "WPA2PSK", "AES"
+        if "WPA3" in auth.upper() or "SAE" in auth.upper():
+            aut, enc = "WPA3SAE", "AES"
+        sec = ('<security><authEncryption><authentication>%s</authentication>'
+               '<encryption>%s</encryption><useOneX>false</useOneX></authEncryption>'
+               '<sharedKey><keyType>passPhrase</keyType><protected>false</protected>'
+               '<keyMaterial>%s</keyMaterial></sharedKey></security>'
+               % (aut, enc, _xml_escape(password)))
+    xml = ('<?xml version="1.0"?>\n'
+           '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">\n'
+           '  <name>%s</name>\n'
+           '  <SSIDConfig><SSID><name>%s</name></SSID></SSIDConfig>\n'
+           '  <connectionType>ESS</connectionType>\n'
+           '  <connectionMode>manual</connectionMode>\n'
+           '  <MSM>%s</MSM>\n'
+           '</WLANProfile>\n' % (_xml_escape(ssid), _xml_escape(ssid), sec))
+    path = os.path.join(str(DATA), "_wlan_new.xml")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(xml)
+    except Exception as e:
+        return False, "写配置失败: %r" % (e,)
+    ok, msg = netsh_do(["wlan", "add", "profile", "filename=" + path],
+                       "已添加 WiFi「%s」" % ssid)
+    if not ok:
+        return ok, msg
+    return netsh_do(["wlan", "connect", "name=" + ssid, "ssid=" + ssid],
+                    "正在连接「%s」" % ssid)
+
+
 def do_detection():
     """检测本机系统配置, 写报告, 返回 (报告路径, 摘要文本)。"""
     com_init()
@@ -2097,7 +2371,8 @@ class EditorWindow:
                      "tv_lan", "lbl_lan_cur", "var_lanip", "var_lanmask",
                      "var_langw", "var_landns1", "var_landns2",
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
-                     "global_mode_work"):
+                     "global_mode_work", "tv_scan", "btn_scan_toggle", "scan_body",
+                     "lbl_scan", "txt_sys"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2611,7 +2886,9 @@ class EditorWindow:
         import tkinter as tk
         from tkinter import ttk
         f = ttk.Frame(parent, padding=8)
-        left = ttk.Frame(f)
+        top = ttk.Frame(f)
+        top.pack(fill="both", expand=True)
+        left = ttk.Frame(top)
         left.pack(side="left", fill="both", expand=True)
         ttk.Label(left, text="已保存的 WiFi 配置 (双击 = 连接)").pack(anchor="w")
         self.lbl_wifi_head = ttk.Label(left, text="", foreground=THEME["accent"])
@@ -2619,7 +2896,7 @@ class EditorWindow:
         g = ttk.Frame(left)
         g.pack(fill="both", expand=True, pady=4)
         self.tv_wifi = ttk.Treeview(g, columns=("ssid", "state"),
-                                    show="headings", height=10)
+                                    show="headings", height=8)
         self.tv_wifi.heading("ssid", text="WiFi 名称 (SSID)")
         self.tv_wifi.heading("state", text="状态")
         self.tv_wifi.column("ssid", width=280, anchor="w")
@@ -2641,7 +2918,7 @@ class EditorWindow:
         ttk.Button(row, text="⚙ 系统 WiFi 面板",
                    command=self._wifi_open_settings).pack(side="left")
 
-        det = ttk.LabelFrame(f, text="WiFi 配置 (可直接编辑, 保存进系统)")
+        det = ttk.LabelFrame(top, text="WiFi 配置 (可直接编辑, 保存进系统)")
         det.pack(side="left", fill="y", padx=(10, 0), ipadx=10, ipady=8)
         self.lbl_wifi_cur = ttk.Label(det, text="(左侧选中一个 WiFi 配置)",
                                       foreground=THEME["accent"])
@@ -2670,6 +2947,42 @@ class EditorWindow:
                   text="• 密码留空 = 不修改密码\n"
                        "• 保存后重新连接该 WiFi 才生效"
                   ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        # ---- 附近 WiFi (未保存的网络) 折叠区
+        self.btn_scan_toggle = ttk.Button(
+            f, text="📡 附近 WiFi (扫描到未保存的网络)  ▶",
+            command=self._wifi_scan_toggle)
+        self.btn_scan_toggle.pack(fill="x", pady=(10, 0))
+        self.scan_body = ttk.Frame(f)
+        self.lbl_scan = ttk.Label(self.scan_body, text="", foreground=THEME["dim"])
+        self.lbl_scan.pack(anchor="w")
+        sg = ttk.Frame(self.scan_body)
+        sg.pack(fill="both", expand=True, pady=4)
+        self.tv_scan = ttk.Treeview(sg, columns=("ssid", "signal", "auth", "band"),
+                                    show="headings", height=5)
+        self.tv_scan.heading("ssid", text="SSID")
+        self.tv_scan.heading("signal", text="信号")
+        self.tv_scan.heading("auth", text="加密")
+        self.tv_scan.heading("band", text="频段/通道")
+        self.tv_scan.column("ssid", width=260, anchor="w")
+        self.tv_scan.column("signal", width=70, anchor="w")
+        self.tv_scan.column("auth", width=140, anchor="w")
+        self.tv_scan.column("band", width=120, anchor="w")
+        self.tv_scan.bind("<Double-1>", lambda e: self._wifi_scan_connect())
+        ssb = ttk.Scrollbar(sg, orient="vertical", command=self.tv_scan.yview)
+        self.tv_scan.configure(yscrollcommand=ssb.set)
+        self.tv_scan.grid(row=0, column=0, sticky="nsew")
+        ssb.grid(row=0, column=1, sticky="ns")
+        sg.rowconfigure(0, weight=1)
+        sg.columnconfigure(0, weight=1)
+        srow = ttk.Frame(self.scan_body)
+        srow.pack(fill="x", pady=(4, 0))
+        ttk.Button(srow, text="🌀 重新扫描", command=self._wifi_scan_load).pack(side="left")
+        ttk.Button(srow, text="📡 连接所选",
+                   command=self._wifi_scan_connect).pack(side="left", padx=6)
+        ttk.Label(srow, foreground=THEME["dim"],
+                  text="未保存的网络双击=连接(会询问密码); 扫描需无线网卡可用。"
+                  ).pack(side="left", padx=10)
         return f
 
     # ---------------- 网络: 以太网 / 网卡子页
@@ -2939,7 +3252,77 @@ class EditorWindow:
         t.pack(fill="both", expand=True)
         t.insert("1.0", txt)
 
+    # ---------------- 网络: 附近 WiFi 扫描
+    def _wifi_scan_toggle(self):
+        if self.scan_body.winfo_ismapped():
+            self.scan_body.pack_forget()
+            self.btn_scan_toggle.configure(text="📡 附近 WiFi (扫描到未保存的网络)  ▶")
+        else:
+            self.scan_body.pack(fill="both", expand=True)
+            self.btn_scan_toggle.configure(text="📡 附近 WiFi (扫描到未保存的网络)  ▼")
+            if not self.tv_scan.get_children():
+                self._wifi_scan_load()
+
+    def _wifi_scan_load(self):
+        self.lbl_scan.configure(text="正在扫描附近 WiFi…")
+
+        def done(res):
+            try:
+                rows = res if isinstance(res, list) else []
+            except Exception:
+                rows = []
+            self._wifi_scan_fill(rows)
+
+        self._async(wifi_scan_networks, done)
+
+    def _wifi_scan_fill(self, rows):
+        try:
+            self.tv_scan.delete(*self.tv_scan.get_children())
+            for i, r in enumerate(rows):
+                self.tv_scan.insert(
+                    "", "end",
+                    values=(r["ssid"],
+                            ("%d%%" % r["signal"]) if r.get("signal") is not None else "-",
+                            r.get("auth") or "-", r.get("band") or "-"),
+                    tags=("zebra",) if i % 2 else ())
+        except Exception:
+            pass
+        self.lbl_scan.configure(text="扫描到 %d 个未保存的网络 (按信号降序)" % len(rows))
+
+    def _wifi_scan_connect(self):
+        sel = self.tv_scan.selection()
+        if not sel:
+            self.set_status("先在附近 WiFi 列表里选中一个网络")
+            return
+        vals = self.tv_scan.item(sel[0], "values")
+        ssid, auth = vals[0], vals[2]
+        need_pwd = bool(auth) and ("开放" not in auth and "Open" not in auth)
+        pwd = ""
+        if need_pwd:
+            import tkinter.simpledialog as sd
+            pwd = sd.askstring("连接 WiFi", "输入「%s」的密码:" % ssid,
+                               parent=self.root)
+            if pwd is None:
+                return
+            pwd = pwd.strip()
+            if not pwd:
+                self.set_status("密码不能为空, 已取消")
+                return
+        self.set_status("正在连接「%s」…" % ssid)
+
+        def work():
+            return wifi_connect_new(ssid, pwd, auth)
+
+        def done(res):
+            ok, msg = res if isinstance(res, tuple) else (True, str(res))
+            self.set_status(("✅ " if ok else "❌ ") + str(msg))
+            if ok:
+                self._wifi_load()
+
+        self._async(work, done)
+
     # ---------------- 网络: 网卡处理
+
     def _lan_load(self, ev=None):
         """刷新网卡列表 (后台加载, 不卡界面)。"""
         self._net_load_async()
@@ -3081,21 +3464,38 @@ class EditorWindow:
         import tkinter as tk
         from tkinter import ttk
         f = ttk.Frame(self.root, padding=16)
-        self.lbl_auto = ttk.Label(f, text="")
-        self.lbl_auto.pack(anchor="w")
+        head = ttk.Frame(f)
+        head.pack(fill="x")
+        self.lbl_auto = ttk.Label(head, text="")
+        self.lbl_auto.pack(side="left")
+        ttk.Button(head, text="🌀 刷新系统信息",
+                   command=self._sys_info_load).pack(side="right")
+
+        g = ttk.Frame(f)
+        g.pack(fill="both", expand=True, pady=8)
+        self.txt_sys = tk.Text(g, wrap="word", font=("Consolas", 9),
+                               bg=THEME["panel2"], fg=THEME["fg"],
+                               insertbackground=THEME["accent"], relief="flat",
+                               padx=12, pady=10)
+        sb = ttk.Scrollbar(g, orient="vertical", command=self.txt_sys.yview)
+        self.txt_sys.configure(yscrollcommand=sb.set)
+        self.txt_sys.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        g.rowconfigure(0, weight=1)
+        g.columnconfigure(0, weight=1)
+
         row = ttk.Frame(f)
-        row.pack(pady=8)
+        row.pack(fill="x", pady=(0, 8))
         ttk.Button(row, text="🚀 开机自启 开 / 关", command=self._sys_autostart).pack(side="left")
         ttk.Button(row, text="🩺 重新检测本机配置", command=self._sys_redetect).pack(side="left", padx=8)
         ttk.Button(row, text="📄 打开检测报告", command=self._sys_report).pack(side="left")
         ttk.Button(row, text="📁 打开程序文件夹", command=self._sys_folder).pack(side="left", padx=8)
-        ttk.Button(row, text="❌ 退出程序", command=self._sys_quit).pack(side="left")
-        row2 = ttk.Frame(f)
-        row2.pack(pady=(4, 0))
-        ttk.Button(row2, text="🔓 以管理员身份重启", command=self._sys_admin).pack(side="left")
+        ttk.Button(row, text="🔓 以管理员身份重启", command=self._sys_admin).pack(side="left")
+        ttk.Button(row, text="❌ 退出程序", command=self._sys_quit).pack(side="left", padx=8)
         ttk.Label(f, foreground=THEME["dim"],
                   text="双击托盘图标可重新打开本窗口; 右键托盘 = 快速切换模式。"
-                  ).pack(pady=(10, 0))
+                  ).pack(anchor="w")
+        self._sys_info_load()
         return f
 
     # ---------- 音量/显示/系统页动作
@@ -3159,6 +3559,27 @@ class EditorWindow:
 
     def _sys_quit(self):
         self.app.quit()
+
+    def _sys_info_load(self):
+        self.txt_sys.configure(state="normal")
+        self.txt_sys.delete("1.0", "end")
+        self.txt_sys.insert("1.0", "正在读取系统信息…")
+        self.txt_sys.configure(state="disabled")
+
+        def done(res):
+            try:
+                text = format_system_info(res)
+            except Exception:
+                text = "读取系统信息失败"
+            try:
+                self.txt_sys.configure(state="normal")
+                self.txt_sys.delete("1.0", "end")
+                self.txt_sys.insert("1.0", text)
+                self.txt_sys.configure(state="disabled")
+            except Exception:
+                pass
+
+        self._async(collect_system_detailed, done)
 
     def _net_status(self):
         self.app.show_net()
