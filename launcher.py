@@ -41,7 +41,7 @@ LOG_PATH = DATA / "log.txt"
 MUTEX_NAME = "QuickLauncher_SingleInstance"
 
 APP_TITLE = "快捷启动台"
-APP_VER = "v1.8"
+APP_VER = "v1.9"
 GLOBAL_MODE_NAME = "全局模式"
 
 # 深色科技风主题色板
