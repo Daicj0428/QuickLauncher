@@ -1330,6 +1330,43 @@ def _gpu_snapshot():
     return res
 
 
+def _fmt_rate(bps):
+    bps = max(0.0, bps or 0.0)
+    if bps >= 1048576.0:
+        return "%.1f MB/s" % (bps / 1048576.0)
+    if bps >= 1024.0:
+        return "%.0f KB/s" % (bps / 1024.0)
+    return "%.0f B/s" % bps
+
+
+def _net_stats():
+    """本机所有网卡的累计收/发字节。返回 (recv_bytes, sent_bytes)。"""
+    try:
+        rc, out, _ = run_capture(["powershell", "-NoProfile", "-Command",
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+            "Get-NetAdapterStatistics | ForEach-Object { '{0}|{1}' -f $_.ReceivedBytes, $_.SentBytes }"],
+            timeout=30)
+    except Exception:
+        return 0, 0
+    if rc != 0:
+        return 0, 0
+    recv = sent = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        a, _, b = line.partition("|")
+        try:
+            recv += int(a.strip() or "0")
+        except Exception:
+            pass
+        try:
+            sent += int(b.strip() or "0")
+        except Exception:
+            pass
+    return recv, sent
+
+
 def _proc_snapshot():
     """一次取全量进程的 CPU(累计秒) 与内存(字节)。返回 {映像名小写: {count,cpu,mem}}。"""
     out = ps("Get-Process | ForEach-Object { "
@@ -1377,8 +1414,8 @@ def _img_key(img):
 
 
 def mode_resource_usage(entries):
-    """统计给定应用条目(列表)的资源占用。两次采样估算 CPU%。
-    返回 [{name,image,running,count,mem_mb,cpu_pct,disk_bps,conn,gpu_pct}] 按内存降序。"""
+    """统计给定应用条目(列表)的资源占用。两次采样估算 CPU% 与整机网络速率。
+    返回 {"rows":[{name,image,running,count,mem_mb,cpu_pct,disk_bps,gpu_pct}], "down_bps":, "up_bps":}。"""
     images = {}
     for e in entries:
         if not isinstance(e, dict):
@@ -1387,28 +1424,28 @@ def mode_resource_usage(entries):
         if img:
             images.setdefault(_img_key(img), e.get("name") or img)
     if not images:
-        return []
+        return {"rows": [], "down_bps": 0.0, "up_bps": 0.0}
     logical = (cpu_info().get("logical") or 1)
     t0 = time.time()
+    net0 = _net_stats()
     s1, pid2name = _proc_snapshot()
     disk = _disk_snapshot()
-    conn = _conn_snapshot()
     gpu = _gpu_snapshot()
     s2, pid2name2 = _proc_snapshot()
+    net1 = _net_stats()
     pid2name.update(pid2name2)
     elapsed = max(time.time() - t0, 0.5)
     agg = {}
     for pid, nm in pid2name.items():
-        a = agg.setdefault(nm, {"disk": 0.0, "conn": 0, "gpu": 0.0})
+        a = agg.setdefault(nm, {"disk": 0.0, "gpu": 0.0})
         a["disk"] += disk.get(pid, 0.0)
-        a["conn"] += conn.get(pid, 0)
         a["gpu"] += gpu.get(pid, 0.0)
     rows = []
     for key in images:
         a = s1.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
         b = s2.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
         dcpu = b["cpu"] - a["cpu"]
-        extra = agg.get(key, {"disk": 0.0, "conn": 0, "gpu": 0.0})
+        extra = agg.get(key, {"disk": 0.0, "gpu": 0.0})
         rows.append({
             "name": images[key],
             "image": key,
@@ -1417,11 +1454,12 @@ def mode_resource_usage(entries):
             "mem_mb": b["mem"] / 1048576.0,
             "cpu_pct": dcpu / elapsed / logical * 100.0,
             "disk_bps": extra["disk"],
-            "conn": extra["conn"],
             "gpu_pct": extra["gpu"],
         })
     rows.sort(key=lambda r: (-r["mem_mb"], -r["cpu_pct"]))
-    return rows
+    return {"rows": rows,
+            "down_bps": max(0.0, (net1[0] - net0[0]) / elapsed),
+            "up_bps": max(0.0, (net1[1] - net0[1]) / elapsed)}
 
 
 def collect_system_detailed():
@@ -2661,7 +2699,7 @@ class EditorWindow:
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
                      "global_mode_work", "tv_scan", "btn_scan_toggle", "scan_body",
                      "lbl_scan", "txt_sys", "tv_res",
-                     "btn_wifi_radio", "var_autorefresh"):
+                     "btn_wifi_radio", "var_autorefresh", "lbl_net_rate"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2867,7 +2905,7 @@ class EditorWindow:
         hdr = ttk.Frame(self.root, style="Header.TFrame")
         hdr.pack(fill="x", padx=14, pady=(10, 0))
         ttk.Label(hdr, text="⚡ 快捷启动台", style="H1.TLabel").pack(side="left")
-        ttk.Label(hdr, text="QuickLauncher %s  ·  系统增强面板" % APP_VER,
+        ttk.Label(hdr, text="QuickLauncher %s" % APP_VER,
                   style="Sub.TLabel").pack(side="left", padx=(12, 0), pady=(8, 0))
         self.lbl_chip = ttk.Label(hdr, text="", style="Accent.TLabel")
         self.lbl_chip.pack(side="right", padx=(0, 10), pady=(6, 0))
@@ -3820,12 +3858,15 @@ class EditorWindow:
         res.pack(fill="both", expand=True, pady=(0, 8))
         rhead = ttk.Frame(res)
         rhead.pack(fill="x")
+        self.lbl_net_rate = ttk.Label(rhead, foreground=THEME["accent"],
+                                      text="🌐 网络速率: 计算中…")
+        self.lbl_net_rate.pack(side="left")
         ttk.Label(rhead, foreground=THEME["dim"],
-                  text="内存/CPU/磁盘/网络/GPU，点右上角重新采样").pack(side="left")
+                  text="内存 / CPU / 磁盘 / GPU 逐应用采样 · 网络为整机速率").pack(side="left", padx=10)
         ttk.Button(rhead, text="🔄 刷新资源",
                    command=self._res_load).pack(side="right")
         self.tv_res = ttk.Treeview(
-            res, columns=("app", "state", "cnt", "cpu", "mem", "disk", "conn", "gpu"),
+            res, columns=("app", "state", "cnt", "cpu", "mem", "disk", "gpu"),
             show="headings", height=7)
         self.tv_res.heading("app", text="应用")
         self.tv_res.heading("state", text="状态")
@@ -3833,16 +3874,14 @@ class EditorWindow:
         self.tv_res.heading("cpu", text="CPU")
         self.tv_res.heading("mem", text="内存")
         self.tv_res.heading("disk", text="磁盘")
-        self.tv_res.heading("conn", text="网络")
         self.tv_res.heading("gpu", text="GPU")
-        self.tv_res.column("app", width=170, anchor="w")
+        self.tv_res.column("app", width=200, anchor="center")
         self.tv_res.column("state", width=72, anchor="center")
         self.tv_res.column("cnt", width=52, anchor="center")
-        self.tv_res.column("cpu", width=70, anchor="e")
-        self.tv_res.column("mem", width=90, anchor="e")
-        self.tv_res.column("disk", width=80, anchor="e")
-        self.tv_res.column("conn", width=60, anchor="e")
-        self.tv_res.column("gpu", width=60, anchor="e")
+        self.tv_res.column("cpu", width=70, anchor="center")
+        self.tv_res.column("mem", width=90, anchor="center")
+        self.tv_res.column("disk", width=90, anchor="center")
+        self.tv_res.column("gpu", width=60, anchor="center")
         rsb = ttk.Scrollbar(res, orient="vertical", command=self.tv_res.yview)
         self.tv_res.configure(yscrollcommand=rsb.set)
         self.tv_res.pack(side="left", fill="both", expand=True, pady=(4, 0))
@@ -3996,7 +4035,11 @@ class EditorWindow:
         def done(res):
             self._res_loading = False
             try:
-                self._res_fill(res if isinstance(res, list) else [])
+                if isinstance(res, dict):
+                    self._res_fill(res)
+                else:
+                    self._res_fill({"rows": res if isinstance(res, list) else [],
+                                    "down_bps": 0.0, "up_bps": 0.0})
             except Exception:
                 log_exc()
         try:
@@ -4005,8 +4048,16 @@ class EditorWindow:
             self._res_loading = False
             log_exc()
 
-    def _res_fill(self, rows):
+    def _res_fill(self, data):
+        rows = (data or {}).get("rows") or []
         self.tv_res.delete(*self.tv_res.get_children())
+        if hasattr(self, "lbl_net_rate"):
+            try:
+                self.lbl_net_rate.config(text="🌐 网络速率: ↓ %s · ↑ %s" % (
+                    _fmt_rate(data.get("down_bps", 0.0)),
+                    _fmt_rate(data.get("up_bps", 0.0))))
+            except Exception:
+                pass
         for i, r in enumerate(rows):
             gpu = r.get("gpu_pct", 0.0) or 0.0
             self.tv_res.insert(
@@ -4017,8 +4068,7 @@ class EditorWindow:
                         "%.1f%%" % max(0.0, r.get("cpu_pct", 0.0)),
                         "%.1f MB" % r.get("mem_mb", 0.0),
                         "%.1f MB/s" % (r.get("disk_bps", 0.0) / 1048576.0),
-                        "%d 连接" % r.get("conn", 0),
-                        ("%.0f%%" % gpu) if gpu > 0 else "—"),
+                        "%.0f%%" % max(0.0, gpu)),
                 tags=("zebra",) if i % 2 else ())
 
     def _net_status(self):
