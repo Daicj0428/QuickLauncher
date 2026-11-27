@@ -1136,6 +1136,77 @@ def os_info():
             "user": os.environ.get("USERNAME", "")}
 
 
+def _proc_snapshot():
+    """一次取全量进程的 CPU(累计秒) 与内存(字节)。返回 {映像名小写: {count,cpu,mem}}。"""
+    out = ps("Get-Process | ForEach-Object { "
+             "\"$($_.ProcessName)|$($_.Id)|$($_.CPU)|$($_.WorkingSet64)\" }")
+    data = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 4:
+            continue
+        name = parts[0].strip().lower()
+        if not name:
+            continue
+        try:
+            cpu = float(parts[2].strip() or "0")
+        except Exception:
+            cpu = 0.0
+        try:
+            ws = int(parts[3].strip() or "0")
+        except Exception:
+            ws = 0
+        d = data.setdefault(name, {"count": 0, "cpu": 0.0, "mem": 0})
+        d["count"] += 1
+        d["cpu"] += cpu
+        d["mem"] += ws
+    return data
+
+
+def _img_key(img):
+    """把映像名归一成小写、去掉 .exe/.bat/.cmd 后缀。"""
+    img = (img or "").strip().lower()
+    for ext in (".exe", ".bat", ".cmd"):
+        if img.endswith(ext):
+            return img[:-len(ext)]
+    return img
+
+
+def mode_resource_usage(entries):
+    """统计给定应用条目(列表)的资源占用。两次采样间隔 2s 估算 CPU%。"""
+    images = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        img = entry_image(e)
+        if img:
+            images.setdefault(_img_key(img), e.get("name") or img)
+    if not images:
+        return []
+    logical = (cpu_info().get("logical") or 1)
+    s1 = _proc_snapshot()
+    time.sleep(2.0)
+    s2 = _proc_snapshot()
+    rows = []
+    for key in images:
+        a = s1.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
+        b = s2.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
+        dcpu = b["cpu"] - a["cpu"]
+        rows.append({
+            "name": images[key],
+            "image": key,
+            "running": b["count"] > 0,
+            "count": b["count"],
+            "mem_mb": b["mem"] / 1048576.0,
+            "cpu_pct": dcpu / 2.0 / logical * 100.0,
+        })
+    rows.sort(key=lambda r: (-r["mem_mb"], -r["cpu_pct"]))
+    return rows
+
+
 def collect_system_detailed():
     return {"os": os_info(), "cpu": cpu_info(), "gpu": gpu_info(),
             "mem": memory_info(), "disks": storage_info(),
@@ -2372,7 +2443,7 @@ class EditorWindow:
                      "var_langw", "var_landns1", "var_landns2",
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
                      "global_mode_work", "tv_scan", "btn_scan_toggle", "scan_body",
-                     "lbl_scan", "txt_sys"):
+                     "lbl_scan", "txt_sys", "tv_res"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2589,8 +2660,6 @@ class EditorWindow:
         nb.add(self._tab_apps(), text="  🚀 应用列表  ")
         nb.add(self._tab_modes(), text="  🚀 自定义模式  ")
         nb.add(self._tab_net(), text="  🌐 网络设置  ")
-        nb.add(self._tab_vol(), text="  🔊 音量  ")
-        nb.add(self._tab_display(), text="  🖥 显示设置  ")
         nb.add(self._tab_sys(), text="  ⚙ 系统  ")
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=12, pady=(4, 10))
@@ -2603,7 +2672,7 @@ class EditorWindow:
         ttk.Button(bar, text="💾 保存并生效", style="Accent.TButton",
                    command=self.save).pack(side="right", padx=8)
         # 斑马纹
-        for tv in ("tv_apps", "tv_mapps", "tv_pool", "tv_dns", "tv_wifi", "tv_lan"):
+        for tv in ("tv_apps", "tv_mapps", "tv_pool", "tv_dns", "tv_wifi", "tv_lan", "tv_res"):
             w = getattr(self, tv, None)
             try:
                 if w is not None:
@@ -3472,17 +3541,43 @@ class EditorWindow:
                    command=self._sys_info_load).pack(side="right")
 
         g = ttk.Frame(f)
-        g.pack(fill="both", expand=True, pady=8)
+        g.pack(fill="x", pady=8)
         self.txt_sys = tk.Text(g, wrap="word", font=("Consolas", 9),
                                bg=THEME["panel2"], fg=THEME["fg"],
                                insertbackground=THEME["accent"], relief="flat",
-                               padx=12, pady=10)
+                               padx=12, pady=10, height=13)
         sb = ttk.Scrollbar(g, orient="vertical", command=self.txt_sys.yview)
         self.txt_sys.configure(yscrollcommand=sb.set)
         self.txt_sys.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
         g.rowconfigure(0, weight=1)
         g.columnconfigure(0, weight=1)
+
+        res = ttk.LabelFrame(f, text="📊 当前模式应用资源 (全局模式 + 当前模式)", padding=6)
+        res.pack(fill="both", expand=True, pady=(0, 8))
+        rhead = ttk.Frame(res)
+        rhead.pack(fill="x")
+        ttk.Label(rhead, foreground=THEME["dim"],
+                  text="内存 / CPU 占用，点右上角可重新采样").pack(side="left")
+        ttk.Button(rhead, text="🔄 刷新资源",
+                   command=self._res_load).pack(side="right")
+        self.tv_res = ttk.Treeview(
+            res, columns=("app", "state", "cnt", "mem", "cpu"),
+            show="headings", height=7)
+        self.tv_res.heading("app", text="应用")
+        self.tv_res.heading("state", text="状态")
+        self.tv_res.heading("cnt", text="进程")
+        self.tv_res.heading("mem", text="内存")
+        self.tv_res.heading("cpu", text="CPU")
+        self.tv_res.column("app", width=220, anchor="w")
+        self.tv_res.column("state", width=90, anchor="center")
+        self.tv_res.column("cnt", width=64, anchor="center")
+        self.tv_res.column("mem", width=110, anchor="e")
+        self.tv_res.column("cpu", width=88, anchor="e")
+        rsb = ttk.Scrollbar(res, orient="vertical", command=self.tv_res.yview)
+        self.tv_res.configure(yscrollcommand=rsb.set)
+        self.tv_res.pack(side="left", fill="both", expand=True, pady=(4, 0))
+        rsb.pack(side="right", fill="y", pady=(4, 0))
 
         row = ttk.Frame(f)
         row.pack(fill="x", pady=(0, 8))
@@ -3580,6 +3675,54 @@ class EditorWindow:
                 pass
 
         self._async(collect_system_detailed, done)
+        try:
+            self._res_load()
+        except Exception:
+            log_exc()
+
+    def _res_load(self):
+        """统计当前模式(全局模式 + 当前模式)各应用的资源占用。"""
+        cfg = self.app.config
+        entries = []
+        seen = set()
+        for e in ((cfg.get("global_mode") or {}).get("apps") or []):
+            if not isinstance(e, dict):
+                continue
+            img = _img_key(entry_image(e))
+            if img and img not in seen:
+                seen.add(img)
+                entries.append(e)
+        cur = (cfg.get("current_mode") or "").strip()
+        for md in (cfg.get("modes") or []):
+            if not isinstance(md, dict) or md.get("name") != cur:
+                continue
+            for e in (md.get("apps") or []):
+                if not isinstance(e, dict):
+                    continue
+                img = _img_key(entry_image(e))
+                if img and img not in seen:
+                    seen.add(img)
+                    entries.append(e)
+            break
+
+        def done(res):
+            try:
+                self._res_fill(res if isinstance(res, list) else [])
+            except Exception:
+                log_exc()
+        self._async(lambda: mode_resource_usage(entries), done)
+
+    def _res_fill(self, rows):
+        self.tv_res.delete(*self.tv_res.get_children())
+        for i, r in enumerate(rows):
+            self.tv_res.insert(
+                "", "end", iid=str(i),
+                values=(r.get("name") or r.get("image", ""),
+                        "运行中" if r.get("running") else "未运行",
+                        r.get("count", 0),
+                        "%.1f MB" % r.get("mem_mb", 0.0),
+                        "%.1f%%" % max(0.0, r.get("cpu_pct", 0.0))),
+                tags=("zebra",) if i % 2 else ())
 
     def _net_status(self):
         self.app.show_net()
@@ -3697,12 +3840,6 @@ class EditorWindow:
                 label = fmt_mode(m)
                 self.disp_map[label] = m
                 self.mode_disp_map[label] = {"w": m[0], "h": m[1], "hz": m[2]}
-            cur = get_mode(None)
-            cur_label = fmt_mode(cur) if cur else ""
-            self.cb_disp["values"] = list(self.disp_map)
-            self.var_disp.set(cur_label)
-            self.lbl_disp.config(
-                text=("当前: %s" % cur_label) if cur else "当前: (未获取到)")
             self.cb_modedisp["values"] = ["不改显示", "恢复推荐模式"] + list(self.mode_disp_map)
             self.var_modedisp.set("不改显示")
         except Exception:
