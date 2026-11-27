@@ -1136,11 +1136,206 @@ def os_info():
             "user": os.environ.get("USERNAME", "")}
 
 
+# ---- WiFi 软件无线电开关 (WLAN API, 无需管理员) ----
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [("InterfaceGuid", _GUID), ("strInterfaceDescription", wintypes.LPWSTR),
+                ("isState", wintypes.DWORD)]
+
+
+class _WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [("dwNumberOfItems", wintypes.DWORD), ("dwIndex", wintypes.DWORD),
+                ("InterfaceInfo", _WLAN_INTERFACE_INFO * 1)]
+
+
+class _WLAN_PHY_RADIO_STATE(ctypes.Structure):
+    _fields_ = [("dwPhyIndex", wintypes.DWORD),
+                ("dot11SoftwareRadioState", wintypes.DWORD),
+                ("dot11HardwareRadioState", wintypes.DWORD)]
+
+
+_wlan = None
+
+
+def _wlan_dll():
+    global _wlan
+    if _wlan is None:
+        _wlan = ctypes.WinDLL("wlanapi.dll")
+        _wlan.WlanOpenHandle.argtypes = [wintypes.DWORD, wintypes.LPVOID,
+                                         ctypes.POINTER(wintypes.DWORD),
+                                         ctypes.POINTER(wintypes.HANDLE)]
+        _wlan.WlanOpenHandle.restype = wintypes.DWORD
+        _wlan.WlanCloseHandle.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
+        _wlan.WlanCloseHandle.restype = wintypes.DWORD
+        _wlan.WlanEnumInterfaces.argtypes = [wintypes.HANDLE, wintypes.LPVOID,
+                                             ctypes.POINTER(ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST))]
+        _wlan.WlanEnumInterfaces.restype = wintypes.DWORD
+        _wlan.WlanFreeMemory.argtypes = [wintypes.LPVOID]
+        _wlan.WlanFreeMemory.restype = wintypes.DWORD
+        _wlan.WlanQueryInterface.argtypes = [wintypes.HANDLE, ctypes.POINTER(_GUID),
+                                             wintypes.DWORD, wintypes.LPVOID,
+                                             ctypes.POINTER(wintypes.DWORD),
+                                             ctypes.POINTER(wintypes.LPVOID),
+                                             ctypes.POINTER(wintypes.DWORD)]
+        _wlan.WlanQueryInterface.restype = wintypes.DWORD
+        _wlan.WlanSetInterface.argtypes = [wintypes.HANDLE, ctypes.POINTER(_GUID),
+                                           wintypes.DWORD, wintypes.DWORD,
+                                           wintypes.LPVOID, wintypes.LPVOID]
+        _wlan.WlanSetInterface.restype = wintypes.DWORD
+    return _wlan
+
+
+def _wlan_handle():
+    """打开 WLAN 句柄并返回第一个无线接口的 GUID。失败返回 (None, None)。"""
+    try:
+        w = _wlan_dll()
+        h = wintypes.HANDLE()
+        ver = wintypes.DWORD()
+        if w.WlanOpenHandle(2, None, ctypes.byref(ver), ctypes.byref(h)) != 0:
+            return None, None
+        plist = ctypes.POINTER(_WLAN_INTERFACE_INFO_LIST)()
+        if w.WlanEnumInterfaces(h, None, ctypes.byref(plist)) != 0 or not plist:
+            w.WlanCloseHandle(h, None)
+            return None, None
+        if plist.contents.dwNumberOfItems == 0:
+            w.WlanFreeMemory(plist)
+            w.WlanCloseHandle(h, None)
+            return None, None
+        g = _GUID()
+        ctypes.memmove(ctypes.byref(g),
+                       ctypes.byref(plist.contents.InterfaceInfo[0].InterfaceGuid),
+                       ctypes.sizeof(_GUID))
+        w.WlanFreeMemory(plist)
+        return h, g
+    except Exception:
+        return None, None
+
+
+def wifi_radio_on():
+    """WiFi 软件无线电状态: True=开, False=关, None=未知/失败。"""
+    h, g = _wlan_handle()
+    if h is None or g is None:
+        return None
+    try:
+        w = _wlan_dll()
+        data = wintypes.LPVOID()
+        typ = wintypes.DWORD()
+        if w.WlanQueryInterface(h, ctypes.byref(g), 4, None, ctypes.byref(typ),
+                                ctypes.byref(data), None) != 0 or not data:
+            return None
+        st = ctypes.cast(data, ctypes.POINTER(_WLAN_PHY_RADIO_STATE)).contents
+        return st.dot11SoftwareRadioState == 0
+    except Exception:
+        return None
+    finally:
+        try:
+            _wlan_dll().WlanCloseHandle(h, None)
+        except Exception:
+            pass
+
+
+def wifi_set_radio(on):
+    """切换 WiFi 软件无线电。返回是否成功。"""
+    h, g = _wlan_handle()
+    if h is None or g is None:
+        return False
+    try:
+        w = _wlan_dll()
+        st = _WLAN_PHY_RADIO_STATE()
+        st.dot11SoftwareRadioState = 0 if on else 1
+        rc = w.WlanSetInterface(h, ctypes.byref(g), 4, ctypes.sizeof(st),
+                                ctypes.byref(st), None)
+        return rc == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            _wlan_dll().WlanCloseHandle(h, None)
+        except Exception:
+            pass
+
+
+def _disk_snapshot():
+    """各 PID 的磁盘 I/O 速率(字节/秒), {pid: bytes_per_sec}。"""
+    out = ps('Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | '
+             'Where-Object { $_.IDProcess -gt 4 } | '
+             'ForEach-Object { "$($_.IDProcess)|$($_.IOReadBytesPersec)|$($_.IOWriteBytesPersec)" }')
+    res = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        p = line.split("|")
+        if len(p) < 3:
+            continue
+        try:
+            pid = int(p[0].strip())
+            r = float(p[1].strip() or "0")
+            w = float(p[2].strip() or "0")
+        except Exception:
+            continue
+        res[pid] = r + w
+    return res
+
+
+def _conn_snapshot():
+    """各 PID 的 TCP 连接数, {pid: count}。"""
+    out = ps('Get-NetTCPConnection -ErrorAction SilentlyContinue | '
+             'Group-Object OwningProcess | '
+             'ForEach-Object { "$($_.Name)|$($_.Count)" }')
+    res = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        p = line.split("|")
+        if len(p) < 2:
+            continue
+        try:
+            pid = int(p[0].strip())
+            cnt = int(p[1].strip())
+        except Exception:
+            continue
+        res[pid] = cnt
+    return res
+
+
+def _gpu_snapshot():
+    """各 PID 的 GPU 使用率(%), {pid: sm%}; 无 nvidia-smi 时返回 {}。"""
+    res = {}
+    try:
+        rc, out, _ = run_capture(["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+                                 timeout=25)
+    except Exception:
+        return res
+    if rc != 0:
+        return res
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = line.split()
+        if len(p) < 4:
+            continue
+        try:
+            pid = int(p[1])
+            sm = float(p[3])
+        except Exception:
+            continue
+        res[pid] = sm
+    return res
+
+
 def _proc_snapshot():
     """一次取全量进程的 CPU(累计秒) 与内存(字节)。返回 {映像名小写: {count,cpu,mem}}。"""
     out = ps("Get-Process | ForEach-Object { "
              "\"$($_.ProcessName)|$($_.Id)|$($_.CPU)|$($_.WorkingSet64)\" }")
     data = {}
+    pid2name = {}
     for line in out.splitlines():
         line = line.strip()
         if not line:
@@ -1151,6 +1346,10 @@ def _proc_snapshot():
         name = parts[0].strip().lower()
         if not name:
             continue
+        try:
+            pid = int(parts[1].strip())
+        except Exception:
+            pid = 0
         try:
             cpu = float(parts[2].strip() or "0")
         except Exception:
@@ -1163,7 +1362,9 @@ def _proc_snapshot():
         d["count"] += 1
         d["cpu"] += cpu
         d["mem"] += ws
-    return data
+        if pid:
+            pid2name[pid] = name
+    return data, pid2name
 
 
 def _img_key(img):
@@ -1176,7 +1377,8 @@ def _img_key(img):
 
 
 def mode_resource_usage(entries):
-    """统计给定应用条目(列表)的资源占用。两次采样间隔 2s 估算 CPU%。"""
+    """统计给定应用条目(列表)的资源占用。两次采样估算 CPU%。
+    返回 [{name,image,running,count,mem_mb,cpu_pct,disk_bps,conn,gpu_pct}] 按内存降序。"""
     images = {}
     for e in entries:
         if not isinstance(e, dict):
@@ -1187,21 +1389,36 @@ def mode_resource_usage(entries):
     if not images:
         return []
     logical = (cpu_info().get("logical") or 1)
-    s1 = _proc_snapshot()
-    time.sleep(2.0)
-    s2 = _proc_snapshot()
+    t0 = time.time()
+    s1, pid2name = _proc_snapshot()
+    disk = _disk_snapshot()
+    conn = _conn_snapshot()
+    gpu = _gpu_snapshot()
+    s2, pid2name2 = _proc_snapshot()
+    pid2name.update(pid2name2)
+    elapsed = max(time.time() - t0, 0.5)
+    agg = {}
+    for pid, nm in pid2name.items():
+        a = agg.setdefault(nm, {"disk": 0.0, "conn": 0, "gpu": 0.0})
+        a["disk"] += disk.get(pid, 0.0)
+        a["conn"] += conn.get(pid, 0)
+        a["gpu"] += gpu.get(pid, 0.0)
     rows = []
     for key in images:
         a = s1.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
         b = s2.get(key, {"count": 0, "cpu": 0.0, "mem": 0})
         dcpu = b["cpu"] - a["cpu"]
+        extra = agg.get(key, {"disk": 0.0, "conn": 0, "gpu": 0.0})
         rows.append({
             "name": images[key],
             "image": key,
             "running": b["count"] > 0,
             "count": b["count"],
             "mem_mb": b["mem"] / 1048576.0,
-            "cpu_pct": dcpu / 2.0 / logical * 100.0,
+            "cpu_pct": dcpu / elapsed / logical * 100.0,
+            "disk_bps": extra["disk"],
+            "conn": extra["conn"],
+            "gpu_pct": extra["gpu"],
         })
     rows.sort(key=lambda r: (-r["mem_mb"], -r["cpu_pct"]))
     return rows
@@ -2443,7 +2660,8 @@ class EditorWindow:
                      "var_langw", "var_landns1", "var_landns2",
                      "var_pool_search", "ent_pool_search", "lbl_pool_count",
                      "global_mode_work", "tv_scan", "btn_scan_toggle", "scan_body",
-                     "lbl_scan", "txt_sys", "tv_res"):
+                     "lbl_scan", "txt_sys", "tv_res",
+                     "btn_wifi_radio", "var_autorefresh"):
             try:
                 setattr(self, attr, None)
             except Exception:
@@ -2955,6 +3173,13 @@ class EditorWindow:
         import tkinter as tk
         from tkinter import ttk
         f = ttk.Frame(parent, padding=8)
+        rhead = ttk.Frame(f)
+        rhead.pack(fill="x", pady=(0, 8))
+        self.btn_wifi_radio = ttk.Button(rhead, text="WiFi: 检测中…",
+                                         command=self._wifi_radio_toggle)
+        self.btn_wifi_radio.pack(side="left")
+        ttk.Label(rhead, foreground=THEME["dim"],
+                  text="一键开启 / 关闭 WiFi 无线开关").pack(side="left", padx=8)
         top = ttk.Frame(f)
         top.pack(fill="both", expand=True)
         left = ttk.Frame(top)
@@ -3173,6 +3398,37 @@ class EditorWindow:
         return f
 
     # ---------------- 网络: WiFi 处理
+    def _wifi_radio_refresh(self):
+        try:
+            st = wifi_radio_on()
+            if st is True:
+                self.btn_wifi_radio.configure(text="WiFi: ✅ 已开启 (点击关闭)")
+            elif st is False:
+                self.btn_wifi_radio.configure(text="WiFi: ⛔ 已关闭 (点击开启)")
+            else:
+                self.btn_wifi_radio.configure(text="WiFi: 状态未知 (点击切换)")
+        except Exception:
+            pass
+
+    def _wifi_radio_toggle(self):
+        cur = wifi_radio_on()
+        target = False if (cur is True) else True
+        self.btn_wifi_radio.configure(state="disabled", text="WiFi: 正在切换…")
+        self.set_status("正在%s WiFi…" % ("关闭" if not target else "开启"))
+
+        def done(res):
+            try:
+                self.btn_wifi_radio.configure(state="normal")
+                if res:
+                    self.set_status("WiFi 已%s" % ("关闭" if not target else "开启"))
+                else:
+                    self.set_status("WiFi 切换失败 (可能需要管理员权限)")
+                self._wifi_radio_refresh()
+                self._net_load_async()
+            except Exception:
+                log_exc()
+        self._async(lambda: wifi_set_radio(target), done)
+
     def _wifi_load(self, ev=None):
         """刷新 WiFi 列表 (后台加载, 不卡界面)。"""
         self._net_load_async()
@@ -3224,6 +3480,10 @@ class EditorWindow:
                 return
             self._wifi_fill(rows_w, connected, ssid)
             self._lan_fill(rows_l)
+            try:
+                self._wifi_radio_refresh()
+            except Exception:
+                pass
 
         try:
             self._async(work, done)
@@ -3537,6 +3797,9 @@ class EditorWindow:
         head.pack(fill="x")
         self.lbl_auto = ttk.Label(head, text="")
         self.lbl_auto.pack(side="left")
+        self.var_autorefresh = tk.BooleanVar(value=False)
+        ttk.Checkbutton(head, text="⏱ 动态刷新 (每 5 秒)",
+                        variable=self.var_autorefresh).pack(side="left", padx=12)
         ttk.Button(head, text="🌀 刷新系统信息",
                    command=self._sys_info_load).pack(side="right")
 
@@ -3558,22 +3821,28 @@ class EditorWindow:
         rhead = ttk.Frame(res)
         rhead.pack(fill="x")
         ttk.Label(rhead, foreground=THEME["dim"],
-                  text="内存 / CPU 占用，点右上角可重新采样").pack(side="left")
+                  text="内存/CPU/磁盘/网络/GPU，点右上角重新采样").pack(side="left")
         ttk.Button(rhead, text="🔄 刷新资源",
                    command=self._res_load).pack(side="right")
         self.tv_res = ttk.Treeview(
-            res, columns=("app", "state", "cnt", "mem", "cpu"),
+            res, columns=("app", "state", "cnt", "cpu", "mem", "disk", "conn", "gpu"),
             show="headings", height=7)
         self.tv_res.heading("app", text="应用")
         self.tv_res.heading("state", text="状态")
         self.tv_res.heading("cnt", text="进程")
-        self.tv_res.heading("mem", text="内存")
         self.tv_res.heading("cpu", text="CPU")
-        self.tv_res.column("app", width=220, anchor="w")
-        self.tv_res.column("state", width=90, anchor="center")
-        self.tv_res.column("cnt", width=64, anchor="center")
-        self.tv_res.column("mem", width=110, anchor="e")
-        self.tv_res.column("cpu", width=88, anchor="e")
+        self.tv_res.heading("mem", text="内存")
+        self.tv_res.heading("disk", text="磁盘")
+        self.tv_res.heading("conn", text="网络")
+        self.tv_res.heading("gpu", text="GPU")
+        self.tv_res.column("app", width=170, anchor="w")
+        self.tv_res.column("state", width=72, anchor="center")
+        self.tv_res.column("cnt", width=52, anchor="center")
+        self.tv_res.column("cpu", width=70, anchor="e")
+        self.tv_res.column("mem", width=90, anchor="e")
+        self.tv_res.column("disk", width=80, anchor="e")
+        self.tv_res.column("conn", width=60, anchor="e")
+        self.tv_res.column("gpu", width=60, anchor="e")
         rsb = ttk.Scrollbar(res, orient="vertical", command=self.tv_res.yview)
         self.tv_res.configure(yscrollcommand=rsb.set)
         self.tv_res.pack(side="left", fill="both", expand=True, pady=(4, 0))
@@ -3591,6 +3860,7 @@ class EditorWindow:
                   text="双击托盘图标可重新打开本窗口; 右键托盘 = 快速切换模式。"
                   ).pack(anchor="w")
         self._sys_info_load()
+        self.root.after(5000, self._autorefresh_tick)
         return f
 
     # ---------- 音量/显示/系统页动作
@@ -3680,8 +3950,26 @@ class EditorWindow:
         except Exception:
             log_exc()
 
+    def _autorefresh_tick(self):
+        if getattr(self, "_dead", False):
+            return
+        try:
+            if (getattr(self, "var_autorefresh", None)
+                    and self.var_autorefresh.get()
+                    and self.nb.index(self.nb.select()) == 3):
+                self._res_load()
+        except Exception:
+            pass
+        try:
+            self.root.after(5000, self._autorefresh_tick)
+        except Exception:
+            pass
+
     def _res_load(self):
         """统计当前模式(全局模式 + 当前模式)各应用的资源占用。"""
+        if getattr(self, "_res_loading", False):
+            return
+        self._res_loading = True
         cfg = self.app.config
         entries = []
         seen = set()
@@ -3706,22 +3994,31 @@ class EditorWindow:
             break
 
         def done(res):
+            self._res_loading = False
             try:
                 self._res_fill(res if isinstance(res, list) else [])
             except Exception:
                 log_exc()
-        self._async(lambda: mode_resource_usage(entries), done)
+        try:
+            self._async(lambda: mode_resource_usage(entries), done)
+        except Exception:
+            self._res_loading = False
+            log_exc()
 
     def _res_fill(self, rows):
         self.tv_res.delete(*self.tv_res.get_children())
         for i, r in enumerate(rows):
+            gpu = r.get("gpu_pct", 0.0) or 0.0
             self.tv_res.insert(
                 "", "end", iid=str(i),
                 values=(r.get("name") or r.get("image", ""),
                         "运行中" if r.get("running") else "未运行",
                         r.get("count", 0),
+                        "%.1f%%" % max(0.0, r.get("cpu_pct", 0.0)),
                         "%.1f MB" % r.get("mem_mb", 0.0),
-                        "%.1f%%" % max(0.0, r.get("cpu_pct", 0.0))),
+                        "%.1f MB/s" % (r.get("disk_bps", 0.0) / 1048576.0),
+                        "%d 连接" % r.get("conn", 0),
+                        ("%.0f%%" % gpu) if gpu > 0 else "—"),
                 tags=("zebra",) if i % 2 else ())
 
     def _net_status(self):
